@@ -1,4 +1,4 @@
 
-### Deep learning in Rust
+# Deep learning in Rust
 
 This project is for me to learn Rust
