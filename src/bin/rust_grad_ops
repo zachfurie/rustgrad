@@ -22,14 +22,24 @@ struct Tensor {
 //  ----------------------------------- Auxiliary Functions:  -----------------------------------
 
 impl Tensor {
-    fn init_tens(shaper: &Vec<usize>) -> Tensor {
+    fn zeros(shaper: &Vec<usize>) -> Tensor {
         let mut data_len: usize = 1;
         for i in shaper {
             data_len *= i
         }
-        // println!("{}",data_len);
         Tensor {
             data:  vec![0.; data_len], // all tensor data in a single slice 
+            shape: shaper.to_vec() // [i] = length of dimension i
+        }
+    }
+
+    fn ones(shaper: &Vec<usize>) -> Tensor {
+        let mut data_len: usize = 1;
+        for i in shaper {
+            data_len *= i
+        }
+        Tensor {
+            data:  vec![1.; data_len], // all tensor data in a single slice 
             shape: shaper.to_vec() // [i] = length of dimension i
         }
     }
@@ -51,11 +61,32 @@ impl Tensor {
         index += ind[ind.len()-1];
         self.data[index] = elem;
     }
+
+    fn l2(&self) -> usize {
+        self.shape[self.shape.len()-2]
+    }
+
+    fn l(&self) -> usize {
+        self.shape[self.shape.len()-1]
+    }
+
+    fn copy_tens(&self) -> Tensor {
+        let mut new_shape = self.shape.to_vec();
+        let mut new_data = self.data.to_vec();
+        Tensor {
+            data:  new_data, // all tensor data in a single slice 
+            shape: new_shape, // [i] = length of dimension i
+        }
+    }
 }
+
+
+// ----------------------------------- TESTING (will be removed when done) -----------------------------------
 
 pub(crate) fn test() {
     let s: Vec<usize> = vec![2,2];
-    let mut a = Tensor::init_tens(&s);
+    let mut a = Tensor::zeros(&s);
+    let b = a.copy_tens();
     let ind = vec![0,0];
     a.set(ind, 1.);
     let ind = vec![0,1];
@@ -65,12 +96,17 @@ pub(crate) fn test() {
     let ind = vec![1,1];
     a.set(ind, 4.);
 
-    let ind = vec![0,0];
-    println!("{}", a.get(ind));
-    let ind = vec![0,1];
-    println!("{}", a.get(ind));
-    let ind = vec![1,0];
-    println!("{}", a.get(ind));
-    let ind = vec![1,1];
-    println!("{}", a.get(ind));
+    let ind1 = vec![0,0];
+    let ind2 = vec![0,1];
+    let ind3 = vec![1,0];
+    let ind4 = vec![1,1];
+    println!("{} {}", a.get(ind1), a.get(ind2));
+    println!("{} {}", a.get(ind3), a.get(ind4));
+    let ind1 = vec![0,0];
+    let ind2 = vec![0,1];
+    let ind3 = vec![1,0];
+    let ind4 = vec![1,1];
+    println!("{} {}", b.get(ind1), b.get(ind2));
+    println!("{} {}", b.get(ind3), b.get(ind4));
+    
 }
