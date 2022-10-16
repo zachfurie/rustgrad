@@ -1,0 +1,76 @@
+
+
+
+//  ----------------------------------- Data Structures:  -----------------------------------
+
+// struct Node<'a> {
+//     left: &'a Node<'a>,
+// 	right: &'a Node<'a>,
+// 	op: String,
+// 	tensor: &'a Tensor,
+// 	grad: &'a Tensor,
+// 	require_grad: bool,
+// }
+
+
+
+struct Tensor {
+	data:  Vec<f64>, // Float64 all tensor data in a single slice 
+	shape: Vec<usize>, // Int  [i] = length of dimension i
+}
+
+//  ----------------------------------- Auxiliary Functions:  -----------------------------------
+
+impl Tensor {
+    fn init_tens(shaper: &Vec<usize>) -> Tensor {
+        let mut data_len: usize = 1;
+        for i in shaper {
+            data_len *= i
+        }
+        // println!("{}",data_len);
+        Tensor {
+            data:  vec![0.; data_len], // all tensor data in a single slice 
+            shape: shaper.to_vec() // [i] = length of dimension i
+        }
+    }
+
+    fn get(&self, ind: Vec<usize>) -> f64 {
+        let mut index = 0;
+        for (i,x) in ind[..ind.len()-1].iter().enumerate() {
+            index += self.shape[i+1] * x
+        };
+        index += ind[ind.len()-1];
+        self.data[index]
+    }
+    
+    fn set(&mut self, ind: Vec<usize>, elem: f64) {
+        let mut index = 0;
+        for (i,x) in ind[..ind.len()-1].iter().enumerate() {
+            index += self.shape[i+1] * x
+        };
+        index += ind[ind.len()-1];
+        self.data[index] = elem;
+    }
+}
+
+pub(crate) fn test() {
+    let s: Vec<usize> = vec![2,2];
+    let mut a = Tensor::init_tens(&s);
+    let ind = vec![0,0];
+    a.set(ind, 1.);
+    let ind = vec![0,1];
+    a.set(ind, 2.);
+    let ind = vec![1,0];
+    a.set(ind, 3.);
+    let ind = vec![1,1];
+    a.set(ind, 4.);
+
+    let ind = vec![0,0];
+    println!("{}", a.get(ind));
+    let ind = vec![0,1];
+    println!("{}", a.get(ind));
+    let ind = vec![1,0];
+    println!("{}", a.get(ind));
+    let ind = vec![1,1];
+    println!("{}", a.get(ind));
+}
