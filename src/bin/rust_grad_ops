@@ -1,18 +1,23 @@
 
 use rand::prelude::*;
 
+// ----------------------------------- Notes:  ----------------------------------------------
+
+// Need to reset random seed!!!
+
+
 //  ----------------------------------- Data Structures:  -----------------------------------
 
-// struct Node<'a> {
-//     left: &'a Node<'a>,
-// 	right: &'a Node<'a>,
-// 	op: String,
-// 	tensor: &'a Tensor,
-// 	grad: &'a Tensor,
-// 	require_grad: bool,
-// }
-
-
+struct Node {
+    left: Option<Box<Node>>,
+	right: Option<Box<Node>>,
+    // left: Option<&'a Node<'a>>,
+	// right: Option<&'a Node<'a>>,
+	op: &'static str,
+	tensor: Tensor,
+	grad: Tensor,
+	require_grad: bool,
+}
 
 struct Tensor {
 	data:  Vec<f64>, // Float64 all tensor data in a single slice 
@@ -110,8 +115,269 @@ fn add_same_size(dst: &mut Tensor, t: &Tensor ) {
 
 //  ----------------------------------- BASIC OPS:  -----------------------------------
 
+// Inputs, weights, etc
+fn leaf<'a>(tens: Tensor, require_grad: bool) -> Box<Node> {
+	let zero_grad = Tensor::ones(&tens.shape);
+	Box::new(Node {
+        left: None,
+        right: None, 
+        op: "leaf", 
+        tensor: tens, 
+        grad: zero_grad, 
+        require_grad
+    })
+}
+
+// Syntactic sugar for leaf nodes that are weights
+fn weight<'a>(shaper: Vec<usize>) -> Box<Node> {
+	let tens = Tensor::xavier(&shaper);
+    let zero_grad = Tensor::ones(&shaper);
+	Box::new(Node {
+        left: None,
+        right: None, 
+        op: "leaf", 
+        tensor: tens, 
+        grad: zero_grad, 
+        require_grad: true,
+    })
+}
+
+// Add two identically shaped tensors
+fn add<'a>(node1: Box<Node>, node2: Box<Node>) -> Box<Node> { //&'a 
+	let zero_grad = Tensor::ones(&node1.tensor.shape);
+	let data = Tensor::zeros(&node1.tensor.shape);
+	Box::new(Node{
+        left: Some(node1), 
+        right: Some(node2), 
+        op: "+", 
+        tensor: data, 
+        grad: zero_grad, 
+        require_grad: true,
+    })
+}
+
+// Matrix Multiplication
+fn matmul(a: Box<Node>, x: Box<Node>) -> Box<Node> {
+	let zero_grad = Tensor::ones(&vec![x.tensor.l2(), a.tensor.l2()]);
+	let data = Tensor::zeros(&vec![x.tensor.l2(), a.tensor.l2()]);
+	Box::new(Node{
+        left: Some(a), 
+        right: Some(x), 
+        op: "mm",
+        tensor: data, 
+        grad: zero_grad, 
+        require_grad: true,
+    })
+}
+
+// fn matmul<'a>(a: &'a Node, x: &'a Node) -> Node<'a> {
+// 	let zero_grad = Tensor::ones(&vec![x.tensor.l2(), a.tensor.l2()]);
+// 	let data = Tensor::zeros(&vec![x.tensor.l2(), a.tensor.l2()]);
+// 	Node{
+//         left: Some(&a), 
+//         right: Some(&x), 
+//         op: "mm", 
+//         tensor: data, 
+//         grad: zero_grad, 
+//         require_grad: true,
+//     }
+// }
+
+//  ----------------------------------- ML OPS:  -----------------------------------
+
+// Linear layer. Returns output, weight, bias so that weight and bias can be put in params[].
+fn linear<'a>(inn: Box<Node>, out_dim: usize) -> Box<Node> { //  Node<'a>,  Node<'a>) {
+	let l_weight = weight(vec![out_dim, inn.tensor.l()]);
+	let bias = weight(vec![inn.tensor.l2(), out_dim]);
+	let in_times_weight = matmul(l_weight, inn);
+	let plus_bias = add(in_times_weight, bias);
+	plus_bias
+}
+
+// Log Softmax layer
+fn log_softmax<'a>(inn: Box<Node>, target: Box<Node>) -> Node {
+	let zero_grad = Tensor::ones(&inn.tensor.shape);
+	let data = Tensor::zeros(&inn.tensor.shape);
+	Node {
+        left: Some(inn), 
+        right: Some(target), 
+        op: "sm", 
+        tensor: data, 
+        grad: zero_grad, 
+        require_grad: true,
+    }
+}
+
+
+
+//  ----------------------------------- LOSS AND OPTIM:  -----------------------------------
+
+
+
+// ----------------------------------- FORWARD AND BACKWARD: -----------------------------------
+
+// would probably be more efficient for one data tensor to get passed thru forward instead of each node having its own data tensor.
+
+// Forward Pass function. Recursively finds leaf nodes and gets their values, then performs calculations at each node until it gets back to the root (the output layer).
+fn forward(mut root: Box<Node>) -> Box<Node> {
+	if root.op == "leaf" {
+		return root;
+	} else {
+		let zeroed_data = Tensor::zeros(&root.tensor.shape);
+		root.tensor = zeroed_data;
+	}
+	if root.op == "+" { // add
+		// Return tensor a + b
+        let left = forward(root.left.unwrap());
+		let right = forward(root.right.unwrap());
+		for i in 0..root.tensor.shape[root.tensor.shape.len()-2] {
+			for j in 0..root.tensor.shape[root.tensor.shape.len()-1] {
+				root.tensor.set(vec![i, j], left.tensor.get(vec![i, j]) + right.tensor.get(vec![i, j]));
+			};
+		};
+        root.left = Some(left);
+        root.right = Some(right);
+	} else if root.op == "mm" { // matmul
+	    // root.left = Some(forward(Option::unwrap(root.left)));
+        // root.right = Some(forward(Option::unwrap(root.right)));
+        let a = forward(root.left.unwrap());
+		let x = forward(root.right.unwrap());
+        let mut data = root.tensor;
+		for k in 0..x.tensor.l2() {
+            for i in 0..a.tensor.l2() {
+                for j in 0..a.tensor.l() {
+                    let temp2 = a.tensor.get(vec![i,j]) * x.tensor.get(vec![k, j]);
+                    let temp = data.get(vec![k, i]) + temp2;
+                    data.set(vec![k, i], temp)
+                }
+            }
+		}
+        root.left = Some(a);
+        root.right = Some(x);
+        root.tensor = data;
+	} else if root.op == "sm" { // Softmax
+		let a = forward(root.left.unwrap());
+		for i in 0..a.tensor.l2() {
+			let mut layer_sum = 0.;
+			let mut layer_max = 0.000000001;
+			// layer_max is for normalization
+			for j in 0..a.tensor.l() {
+				if a.tensor.get(vec![i, j]) > layer_max {
+					layer_max = a.tensor.get(vec![i, j])
+				}
+			}
+			for j in 0..a.tensor.l() {
+				layer_sum += a.tensor.get(vec![i, j]).exp() - layer_max;
+			}
+			for j in 0..a.tensor.l() {
+				root.tensor.set(vec![i, j], a.tensor.get(vec![i, j]) - layer_sum.ln() - layer_max)
+			}
+		}
+        root.left = Some(a);
+	} 
+    root
+}
+
+fn backward(mut root: Box<Node>) {
+	if !root.require_grad {
+		return;
+	} 
+
+    // check options in left and right 
+
+
+    if {
+		let zeroed_data = Tensor::zeros(&root.tensor.shape);
+		root.tensor = zeroed_data;
+	}
+	if root.op == "+" { // add
+		// Return tensor a + b
+        let left = forward(root.left.unwrap());
+		let right = forward(root.right.unwrap());
+		for i in 0..root.tensor.shape[root.tensor.shape.len()-2] {
+			for j in 0..root.tensor.shape[root.tensor.shape.len()-1] {
+				root.tensor.set(vec![i, j], left.tensor.get(vec![i, j]) + right.tensor.get(vec![i, j]));
+			};
+		};
+        root.left = Some(left);
+        root.right = Some(right);
+	} else if root.op == "mm" { // matmul
+	    // root.left = Some(forward(Option::unwrap(root.left)));
+        // root.right = Some(forward(Option::unwrap(root.right)));
+        let a = forward(root.left.unwrap());
+		let x = forward(root.right.unwrap());
+        let mut data = root.tensor;
+		for k in 0..x.tensor.l2() {
+            for i in 0..a.tensor.l2() {
+                for j in 0..a.tensor.l() {
+                    let temp2 = a.tensor.get(vec![i,j]) * x.tensor.get(vec![k, j]);
+                    let temp = data.get(vec![k, i]) + temp2;
+                    data.set(vec![k, i], temp)
+                }
+            }
+		}
+        root.left = Some(a);
+        root.right = Some(x);
+        root.tensor = data;
+	} else if root.op == "sm" { // Softmax
+		let a = forward(root.left.unwrap());
+		for i in 0..a.tensor.l2() {
+			let mut layer_sum = 0.;
+			let mut layer_max = 0.000000001;
+			// layer_max is for normalization
+			for j in 0..a.tensor.l() {
+				if a.tensor.get(vec![i, j]) > layer_max {
+					layer_max = a.tensor.get(vec![i, j])
+				}
+			}
+			for j in 0..a.tensor.l() {
+				layer_sum += a.tensor.get(vec![i, j]).exp() - layer_max;
+			}
+			for j in 0..a.tensor.l() {
+				root.tensor.set(vec![i, j], a.tensor.get(vec![i, j]) - layer_sum.ln() - layer_max)
+			}
+		}
+        root.left = Some(a);
+	} 
+    root
+}
+
+
+
 
 // ----------------------------------- TESTING (will be removed when done) -----------------------------------
+
+pub(crate) fn foward_test() {
+    let mut a = Tensor::xavier(&vec![2,2]);
+    let mut x = Tensor::xavier(&vec![2,2]);
+
+    let ind = vec![0,0];
+    a.set(ind, 1.);
+    let ind = vec![0,1];
+    a.set(ind, 2.);
+    let ind = vec![1,0];
+    a.set(ind, 3.);
+    let ind = vec![1,1];
+    a.set(ind, 4.);
+
+    let ind = vec![0,0];
+    x.set(ind, 1.);
+    let ind = vec![0,1];
+    x.set(ind, 2.);
+    let ind = vec![1,0];
+    x.set(ind, 3.);
+    let ind = vec![1,1];
+    x.set(ind, 4.);
+
+    println!("a: {:?}", x.data);
+    println!("x: {:?}", x.data);
+    let in1 = leaf(a, false);
+    let in2 = leaf(x, false);
+    let l1 = linear(in1, 10);
+    println!("l1: {:?}", forward(l1).tensor.data);
+
+}
+
 
 pub(crate) fn test() {
     let s: Vec<usize> = vec![2,2];

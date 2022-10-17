@@ -1,7 +1,10 @@
 #[path = "bin/rust_grad_ops"] mod rust_grad_ops;
 
 
+use std::env;
+
 
 fn main() {
-    rust_grad_ops::test();
+    env::set_var("RUST_BACKTRACE", "1");
+    rust_grad_ops::foward_test();
 }
