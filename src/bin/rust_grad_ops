@@ -1,5 +1,8 @@
 
+use std::io;
+
 use rand::prelude::*;
+use csv;
 
 // ----------------------------------- Notes:  ----------------------------------------------
 
@@ -189,28 +192,96 @@ fn matmul(a: Box<Node>, x: Box<Node>) -> Box<Node> {
 fn linear<'a>(inn: Box<Node>, out_dim: usize) -> Box<Node> { //  Node<'a>,  Node<'a>) {
 	let l_weight = weight(vec![out_dim, inn.tensor.l()]);
 	let bias = weight(vec![inn.tensor.l2(), out_dim]);
-	let in_times_weight = matmul(l_weight, inn);
+	let in_times_weight = matmul(l_weight,inn);
 	let plus_bias = add(in_times_weight, bias);
 	plus_bias
 }
 
 // Log Softmax layer
-fn log_softmax<'a>(inn: Box<Node>, target: Box<Node>) -> Node {
+fn log_softmax<'a>(inn: Box<Node>) -> Box<Node> {
 	let zero_grad = Tensor::ones(&inn.tensor.shape);
 	let data = Tensor::zeros(&inn.tensor.shape);
-	Node {
+	Box::new(Node {
         left: Some(inn), 
-        right: Some(target), 
+        right: None, 
         op: "sm", 
         tensor: data, 
         grad: zero_grad, 
         require_grad: true,
-    }
+    })
 }
 
 
 
 //  ----------------------------------- LOSS AND OPTIM:  -----------------------------------
+
+// Negative Log Likelihood. Takes prediction tensor and target tensor as inputs, returns loss, and updates gradients from input
+fn nll_loss(pred: Box<Tensor>, target: Box<Tensor>, gradients: Box<Tensor>) -> f64 {
+	let loss = 0.0;
+	for j in 0..target.l2() {
+		for i in 0..target.l() {
+			let t = target.get(vec![j, i]);
+			loss -= t * pred.get(vec![j, i]);
+			gradients.set(vec![j, i], t);
+		}
+	}
+    loss
+}
+
+// initialize adam optimizer
+struct Adam {
+	// b1 float64, b2 float64
+	t:        f64,// init to 0
+	alpha:    f64,
+	prev_m1s: Vec<Tensor>,
+	prev_m2s: Vec<Tensor>,
+}
+
+impl Adam {
+// Adam Optimizer Step function
+    fn step(&self, weights: Vec<Box<Node>>, out: Box<Node>, bsz: f64) {
+        // parameters: would normally get these from adam_init, but keeping them here as defaults for now.
+        let b1: f64 = 0.9;
+        let b2: f64 = 0.999;
+        let epsilon: f64 = 10.0_f64.powf(-8.0);
+        // ------------
+        self.t += 1.0;
+        let t = self.t;
+        let alpha = self.alpha * (1. - b2.powf(t)).sqrt() / (1. - b1.powf(t));
+        for (k, w) in weights.iter().enumerate() {
+            if !w.require_grad {
+                continue
+            }
+            let prev_m1 = self.prev_m1s[k];
+            let prev_m2 = self.prev_m2s[k];
+            for i in 0..w.grad.l2() {
+                for j in 0..w.grad.l() {
+                    w.grad.set(vec![i,j], w.grad.get(vec![i,j])/bsz); // get mean gradient of batch
+                    //-gradient--clipping-
+                    if w.grad.get(vec![i,j]) > 1.0 {
+                        w.grad.set(vec![i,j], 1.0);
+                    }
+                    if w.grad.get(vec![i,j]) < -1.0 {
+                        w.grad.set(vec![i,j], -1.0);
+                    }
+                    //-------------------
+                    let m1 = prev_m1.get(vec![i,j]);
+                    let m2 = prev_m2.get(vec![i,j]);
+                    let biased_m1 = (m1 * b1) + ((1. - b1) * w.grad.get(vec![i,j]));
+                    let biased_m2 = (m2 * b2) + ((1. - b2) * w.grad.get(vec![i,j]).powf(2.));
+                    w.tensor.set(vec![i,j], w.tensor.get(vec![i,j])-(alpha*biased_m1/(biased_m2.sqrt()+epsilon)));
+                    prev_m1.set(vec![i,j], biased_m1);
+                    prev_m2.set(vec![i,j], biased_m2);
+                }
+            }
+        }
+    }
+
+    // Exponential learning rate decay
+    fn exp_lr_decay(&self, decay_rate: f64, global_step: f64, decay_steps: f64) {
+        self.alpha = self.alpha * (decay_rate.powf(global_step/decay_steps))
+    }
+}
 
 
 
@@ -219,8 +290,11 @@ fn log_softmax<'a>(inn: Box<Node>, target: Box<Node>) -> Node {
 // would probably be more efficient for one data tensor to get passed thru forward instead of each node having its own data tensor.
 
 // Forward Pass function. Recursively finds leaf nodes and gets their values, then performs calculations at each node until it gets back to the root (the output layer).
-fn forward(mut root: Box<Node>) -> Box<Node> {
-	if root.op == "leaf" {
+fn forward(mut root: Box<Node>, f_data: Tensor) -> Box<Node> {
+    if root.op == "input" {
+		root.tensor = f_data;
+        return root;
+	} else if root.op == "leaf" {
 		return root;
 	} else {
 		let zeroed_data = Tensor::zeros(&root.tensor.shape);
@@ -228,8 +302,8 @@ fn forward(mut root: Box<Node>) -> Box<Node> {
 	}
 	if root.op == "+" { // add
 		// Return tensor a + b
-        let left = forward(root.left.unwrap());
-		let right = forward(root.right.unwrap());
+        let left = forward(root.left.unwrap(), f_data);
+		let right = forward(root.right.unwrap(), f_data);
 		for i in 0..root.tensor.shape[root.tensor.shape.len()-2] {
 			for j in 0..root.tensor.shape[root.tensor.shape.len()-1] {
 				root.tensor.set(vec![i, j], left.tensor.get(vec![i, j]) + right.tensor.get(vec![i, j]));
@@ -240,8 +314,8 @@ fn forward(mut root: Box<Node>) -> Box<Node> {
 	} else if root.op == "mm" { // matmul
 	    // root.left = Some(forward(Option::unwrap(root.left)));
         // root.right = Some(forward(Option::unwrap(root.right)));
-        let a = forward(root.left.unwrap());
-		let x = forward(root.right.unwrap());
+        let a = forward(root.left.unwrap(), f_data);
+		let x = forward(root.right.unwrap(), f_data);
         let mut data = root.tensor;
 		for k in 0..x.tensor.l2() {
             for i in 0..a.tensor.l2() {
@@ -256,7 +330,7 @@ fn forward(mut root: Box<Node>) -> Box<Node> {
         root.right = Some(x);
         root.tensor = data;
 	} else if root.op == "sm" { // Softmax
-		let a = forward(root.left.unwrap());
+		let a = forward(root.left.unwrap(), f_data);
 		for i in 0..a.tensor.l2() {
 			let mut layer_sum = 0.;
 			let mut layer_max = 0.000000001;
@@ -278,66 +352,63 @@ fn forward(mut root: Box<Node>) -> Box<Node> {
     root
 }
 
-fn backward(mut root: Box<Node>) {
+fn backward(mut root: Box<Node>) -> Box<Node>{
 	if !root.require_grad {
-		return;
+		return root;
 	} 
-
     // check options in left and right 
-
-
-    if {
-		let zeroed_data = Tensor::zeros(&root.tensor.shape);
-		root.tensor = zeroed_data;
-	}
+    match root.left {
+        None => {}
+        Some(mut x) => {
+            let zeroed_data = Tensor::zeros(&root.tensor.shape);
+            x.grad = zeroed_data;
+            root.left = Some(x)
+        }
+    };
+    match root.right {
+        None => {}
+        Some(mut x) => {
+            let zeroed_data = Tensor::zeros(&root.tensor.shape);
+            x.grad = zeroed_data;
+            root.right = Some(x)
+        }
+    };
 	if root.op == "+" { // add
 		// Return tensor a + b
-        let left = forward(root.left.unwrap());
-		let right = forward(root.right.unwrap());
-		for i in 0..root.tensor.shape[root.tensor.shape.len()-2] {
-			for j in 0..root.tensor.shape[root.tensor.shape.len()-1] {
-				root.tensor.set(vec![i, j], left.tensor.get(vec![i, j]) + right.tensor.get(vec![i, j]));
-			};
-		};
-        root.left = Some(left);
-        root.right = Some(right);
+        let mut left = root.left.unwrap();
+		let mut right = root.right.unwrap();
+		left.grad = root.grad.copy_tens();
+        right.grad = root.grad.copy_tens();
+        root.left = Some(backward(left));
+        root.right = Some(backward(right));
 	} else if root.op == "mm" { // matmul
 	    // root.left = Some(forward(Option::unwrap(root.left)));
         // root.right = Some(forward(Option::unwrap(root.right)));
-        let a = forward(root.left.unwrap());
-		let x = forward(root.right.unwrap());
-        let mut data = root.tensor;
-		for k in 0..x.tensor.l2() {
-            for i in 0..a.tensor.l2() {
+        let mut a = root.left.unwrap();
+		let mut x = root.right.unwrap();
+        let data = root.tensor;
+		for i in 0..a.tensor.l2() {
+            for i2 in 0..x.tensor.l2() {
                 for j in 0..a.tensor.l() {
-                    let temp2 = a.tensor.get(vec![i,j]) * x.tensor.get(vec![k, j]);
-                    let temp = data.get(vec![k, i]) + temp2;
-                    data.set(vec![k, i], temp)
+                    let rootgrad = root.grad.get(vec![i2, i]);
+					let t1 = a.grad.get(vec![i, j]) + (x.tensor.get(vec![i2, j]) * rootgrad);
+					let t2 = x.grad.get(vec![i2, j]) + (a.tensor.get(vec![i, j]) * rootgrad);
+					a.grad.set(vec![i, j], t1);
+					x.grad.set(vec![i2, j], t2);
                 }
             }
 		}
-        root.left = Some(a);
-        root.right = Some(x);
+        root.left = Some(backward(a));
+        root.right = Some(backward(x));
         root.tensor = data;
 	} else if root.op == "sm" { // Softmax
-		let a = forward(root.left.unwrap());
-		for i in 0..a.tensor.l2() {
-			let mut layer_sum = 0.;
-			let mut layer_max = 0.000000001;
-			// layer_max is for normalization
-			for j in 0..a.tensor.l() {
-				if a.tensor.get(vec![i, j]) > layer_max {
-					layer_max = a.tensor.get(vec![i, j])
-				}
-			}
-			for j in 0..a.tensor.l() {
-				layer_sum += a.tensor.get(vec![i, j]).exp() - layer_max;
-			}
-			for j in 0..a.tensor.l() {
-				root.tensor.set(vec![i, j], a.tensor.get(vec![i, j]) - layer_sum.ln() - layer_max)
+		let mut a = root.left.unwrap();
+		for i in 0..root.tensor.l2() {
+			for j in 0..root.tensor.l() {
+				a.grad.set(vec![i, j], -1.*(root.grad.get(vec![i, j])-root.tensor.get(vec![i, j]).exp()))
 			}
 		}
-        root.left = Some(a);
+        root.left = Some(backward(a));
 	} 
     root
 }
@@ -346,6 +417,54 @@ fn backward(mut root: Box<Node>) {
 
 
 // ----------------------------------- TESTING (will be removed when done) -----------------------------------
+
+fn _simple(dim0: usize, dim1: usize) -> Box<Node> {
+    let x_placeholder = Tensor::zeros(&vec![dim0, dim1]);
+	let x_node = leaf(x_placeholder, false);
+    x_node.op = "input";
+    let l1 = linear(x_node, 10);
+    log_softmax(l1)
+}
+
+pub(crate) fn simple() {
+    let batch_size = 51200;
+
+    // read in data
+    let mut x_train = Vec::new();
+    let mut reader = csv::Reader::from_reader(io::stdin());
+    let data =  str::parse::<usize>(reader.records()).expect("file reading error");
+    let d_i = 0;
+    for b in 0..batch_size {
+        let mut x = Tensor::zeros(&vec![1,784]);
+        let mut y = Tensor::zeros(&vec![1,10]);
+        y.set(vec![0, data[d_i]], 1.0);
+        d_i += 1;
+        let mut i = 0;
+        while i < x.data.len() {
+            x.set(vec![0,i], data[d_i]);
+            i += 1;
+            d_i += 1;
+        }
+
+    }
+
+    let out = _simple(1, 784);
+
+    for epoch in 0..10 {
+        for batch in 0..x_train.len() {
+            let x = x_train[batch];
+            let y = y_train[batch];
+            let zero_grad = Tensor::zeros(&out.grad.shape);
+			out.grad = zero_grad;
+
+            out = forward(out, x);
+            out = backward(out);
+
+
+        }
+    }
+}
+
 
 pub(crate) fn foward_test() {
     let mut a = Tensor::xavier(&vec![2,2]);
@@ -374,7 +493,7 @@ pub(crate) fn foward_test() {
     let in1 = leaf(a, false);
     let in2 = leaf(x, false);
     let l1 = linear(in1, 10);
-    println!("l1: {:?}", forward(l1).tensor.data);
+    println!("l1: {:?}", forward(l1, x).tensor.data);
 
 }
 
