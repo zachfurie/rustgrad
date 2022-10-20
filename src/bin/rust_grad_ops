@@ -1,5 +1,5 @@
 
-use std::io;
+use std::{io, fs::File};
 
 use rand::prelude::*;
 use csv;
@@ -216,13 +216,13 @@ fn log_softmax<'a>(inn: Box<Node>) -> Box<Node> {
 //  ----------------------------------- LOSS AND OPTIM:  -----------------------------------
 
 // Negative Log Likelihood. Takes prediction tensor and target tensor as inputs, returns loss, and updates gradients from input
-fn nll_loss(pred: Box<Tensor>, target: Box<Tensor>, gradients: Box<Tensor>) -> f64 {
-	let loss = 0.0;
+fn nll_loss(pred: &mut Box<Node>, target: Box<Tensor>) -> f64 { // mut gradients: Box<Tensor>
+	let mut loss = 0.0;
 	for j in 0..target.l2() {
 		for i in 0..target.l() {
 			let t = target.get(vec![j, i]);
-			loss -= t * pred.get(vec![j, i]);
-			gradients.set(vec![j, i], t);
+			loss -= t * pred.tensor.get(vec![j, i]);
+			pred.grad.set(vec![j, i], t);
 		}
 	}
     loss
@@ -239,7 +239,7 @@ struct Adam {
 
 impl Adam {
 // Adam Optimizer Step function
-    fn step(&self, weights: Vec<Box<Node>>, out: Box<Node>, bsz: f64) {
+    fn step(&mut self, weights:  &mut Vec<&mut Node>, bsz: f64) {
         // parameters: would normally get these from adam_init, but keeping them here as defaults for now.
         let b1: f64 = 0.9;
         let b2: f64 = 0.999;
@@ -248,12 +248,13 @@ impl Adam {
         self.t += 1.0;
         let t = self.t;
         let alpha = self.alpha * (1. - b2.powf(t)).sqrt() / (1. - b1.powf(t));
-        for (k, w) in weights.iter().enumerate() {
+        for k in 0..weights.len() {
+            let w = &mut weights[k];
             if !w.require_grad {
                 continue
             }
-            let prev_m1 = self.prev_m1s[k];
-            let prev_m2 = self.prev_m2s[k];
+            let prev_m1 = &mut self.prev_m1s[k];
+            let prev_m2 = &mut self.prev_m2s[k];
             for i in 0..w.grad.l2() {
                 for j in 0..w.grad.l() {
                     w.grad.set(vec![i,j], w.grad.get(vec![i,j])/bsz); // get mean gradient of batch
@@ -278,7 +279,7 @@ impl Adam {
     }
 
     // Exponential learning rate decay
-    fn exp_lr_decay(&self, decay_rate: f64, global_step: f64, decay_steps: f64) {
+    fn exp_lr_decay(&mut self, decay_rate: f64, global_step: f64, decay_steps: f64) {
         self.alpha = self.alpha * (decay_rate.powf(global_step/decay_steps))
     }
 }
@@ -290,9 +291,9 @@ impl Adam {
 // would probably be more efficient for one data tensor to get passed thru forward instead of each node having its own data tensor.
 
 // Forward Pass function. Recursively finds leaf nodes and gets their values, then performs calculations at each node until it gets back to the root (the output layer).
-fn forward(mut root: Box<Node>, f_data: Tensor) -> Box<Node> {
+fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
     if root.op == "input" {
-		root.tensor = f_data;
+		root.tensor = f_data.copy_tens();
         return root;
 	} else if root.op == "leaf" {
 		return root;
@@ -302,8 +303,8 @@ fn forward(mut root: Box<Node>, f_data: Tensor) -> Box<Node> {
 	}
 	if root.op == "+" { // add
 		// Return tensor a + b
-        let left = forward(root.left.unwrap(), f_data);
-		let right = forward(root.right.unwrap(), f_data);
+        let left = forward(root.left.unwrap(), &f_data);
+		let right = forward(root.right.unwrap(), &f_data);
 		for i in 0..root.tensor.shape[root.tensor.shape.len()-2] {
 			for j in 0..root.tensor.shape[root.tensor.shape.len()-1] {
 				root.tensor.set(vec![i, j], left.tensor.get(vec![i, j]) + right.tensor.get(vec![i, j]));
@@ -420,49 +421,75 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
 
 fn _simple(dim0: usize, dim1: usize) -> Box<Node> {
     let x_placeholder = Tensor::zeros(&vec![dim0, dim1]);
-	let x_node = leaf(x_placeholder, false);
+	let mut x_node = leaf(x_placeholder, false);
     x_node.op = "input";
     let l1 = linear(x_node, 10);
     log_softmax(l1)
 }
 
-pub(crate) fn simple() {
+pub(crate) fn simple() -> std::io::Result<()> {
     let batch_size = 51200;
+    let lr = 0.001;
 
     // read in data
+    let file = File::open("mnist_train.csv")?;
+    let mut rdr = csv::Reader::from_reader(file);
+    let mut data: Vec<csv::StringRecord> = Vec::new();
+    for result in rdr.records() {
+        let record = result?;
+        data.push(record);
+    }
     let mut x_train = Vec::new();
-    let mut reader = csv::Reader::from_reader(io::stdin());
-    let data =  str::parse::<usize>(reader.records()).expect("file reading error");
+    let mut y_train = Vec::new();
+    // let mut x_test = Vec::new();
+    // let mut y_test = Vec::new();
     let d_i = 0;
     for b in 0..batch_size {
+        let data_slice = &data[b];
         let mut x = Tensor::zeros(&vec![1,784]);
         let mut y = Tensor::zeros(&vec![1,10]);
-        y.set(vec![0, data[d_i]], 1.0);
-        d_i += 1;
-        let mut i = 0;
-        while i < x.data.len() {
-            x.set(vec![0,i], data[d_i]);
-            i += 1;
-            d_i += 1;
+        y.set(vec![0, data_slice[0].parse::<usize>().unwrap()], 1.0);
+        for i in 1..x.data.len() {
+            x.set(vec![0,i-1], data_slice[i].parse::<f64>().unwrap());
         }
-
+        x_train.push(x);
+        y_train.push(y);
     }
 
-    let out = _simple(1, 784);
-
+    let mut out = _simple(1, 784);
+    let mut prev_m1 = Vec::new();
+    let mut prev_m2 = Vec::new();
+    let mut opt = Adam {
+        t: 0.0, 
+        alpha: lr, 
+        prev_m1s: prev_m1,
+        prev_m2s: prev_m2,
+    };
     for epoch in 0..10 {
+        let mut total_loss: f64 = 0.;
         for batch in 0..x_train.len() {
-            let x = x_train[batch];
-            let y = y_train[batch];
-            let zero_grad = Tensor::zeros(&out.grad.shape);
-			out.grad = zero_grad;
-
-            out = forward(out, x);
+            let x = x_train[batch].copy_tens();
+            let y = y_train[batch].copy_tens();
+            // let zero_grad = Tensor::zeros(&out.grad.shape);
+			// out.grad = zero_grad;
+            out = forward(out, &x);
+            total_loss += nll_loss(&mut out, Box::new(y));
             out = backward(out);
+            let mut params: Vec<&mut Node> = Vec::new();
+            let mut l1b = out.right.unwrap();
+            let mut l1w = out.left.unwrap().left.unwrap();
+            params.push(l1b.as_mut());
+            params.push(l1w.as_mut());
+            opt.step(&mut params, 1.0)
+            
+
 
 
         }
+        println!("Epoch {} | {}", epoch, total_loss)
     }
+
+    Ok(())
 }
 
 
@@ -493,7 +520,7 @@ pub(crate) fn foward_test() {
     let in1 = leaf(a, false);
     let in2 = leaf(x, false);
     let l1 = linear(in1, 10);
-    println!("l1: {:?}", forward(l1, x).tensor.data);
+    // println!("l1: {:?}", forward(l1, x).tensor.data);
 
 }
 
