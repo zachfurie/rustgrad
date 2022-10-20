@@ -361,7 +361,7 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
     match root.left {
         None => {}
         Some(mut x) => {
-            let zeroed_data = Tensor::zeros(&root.tensor.shape);
+            let zeroed_data = Tensor::zeros(&x.grad.shape);
             x.grad = zeroed_data;
             root.left = Some(x)
         }
@@ -369,7 +369,7 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
     match root.right {
         None => {}
         Some(mut x) => {
-            let zeroed_data = Tensor::zeros(&root.tensor.shape);
+            let zeroed_data = Tensor::zeros(&x.grad.shape);
             x.grad = zeroed_data;
             root.right = Some(x)
         }
@@ -387,10 +387,15 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
         // root.right = Some(forward(Option::unwrap(root.right)));
         let mut a = root.left.unwrap();
 		let mut x = root.right.unwrap();
+        // println!("a tens {:?} | a grad {:?}", a.tensor.shape, a.grad.shape);
+        // println!("x tens {:?} | x grad {:?}", x.tensor.shape, x.grad.shape);
         let data = root.tensor;
 		for i in 0..a.tensor.l2() {
             for i2 in 0..x.tensor.l2() {
                 for j in 0..a.tensor.l() {
+                    // println!("{} {} {}", i2, i, j);
+                    // println!("a tens {:?} | a grad {:?}", a.tensor.shape, a.grad.shape);
+                    // println!("x tens {:?} | x grad {:?}", x.tensor.shape, x.grad.shape);
                     let rootgrad = root.grad.get(vec![i2, i]);
 					let t1 = a.grad.get(vec![i, j]) + (x.tensor.get(vec![i2, j]) * rootgrad);
 					let t2 = x.grad.get(vec![i2, j]) + (a.tensor.get(vec![i, j]) * rootgrad);
@@ -428,7 +433,7 @@ fn _simple(dim0: usize, dim1: usize) -> Box<Node> {
 }
 
 pub(crate) fn simple() -> std::io::Result<()> {
-    let batch_size = 51200;
+    let batch_size = 512; //51200
     let lr = 0.001;
 
     // read in data
@@ -457,14 +462,15 @@ pub(crate) fn simple() -> std::io::Result<()> {
     }
 
     let mut out = _simple(1, 784);
-    let mut prev_m1 = Vec::new();
-    let mut prev_m2 = Vec::new();
+    let prev_m1 = vec![Tensor::zeros(&vec![1,10]), Tensor::zeros(&vec![10,784])];
+    let prev_m2 = vec![Tensor::zeros(&vec![1,10]), Tensor::zeros(&vec![10,784])];
     let mut opt = Adam {
         t: 0.0, 
         alpha: lr, 
         prev_m1s: prev_m1,
         prev_m2s: prev_m2,
     };
+    println!("======= START TRAINING ======");
     for epoch in 0..10 {
         let mut total_loss: f64 = 0.;
         for batch in 0..x_train.len() {
@@ -472,21 +478,33 @@ pub(crate) fn simple() -> std::io::Result<()> {
             let y = y_train[batch].copy_tens();
             // let zero_grad = Tensor::zeros(&out.grad.shape);
 			// out.grad = zero_grad;
+            // println!("forward");
             out = forward(out, &x);
-            total_loss += nll_loss(&mut out, Box::new(y));
+            // println!("loss");
+            let loss = nll_loss(&mut out, Box::new(y));
+            total_loss += loss;
+            // println!("backward");
             out = backward(out);
+            // println!("params");
             let mut params: Vec<&mut Node> = Vec::new();
-            let mut l1b = out.right.unwrap();
-            let mut l1w = out.left.unwrap().left.unwrap();
+            let mut l1p = out.left.unwrap();
+            let mut l1b = l1p.right.unwrap();
+            let mut l1i = l1p.left.unwrap();
+            let mut l1w = l1i.left.unwrap();
             params.push(l1b.as_mut());
             params.push(l1w.as_mut());
-            opt.step(&mut params, 1.0)
-            
+            // println!("step");
+            opt.step(&mut params, 1.0);
+            l1i.left = Some(l1w);
+            l1p.left = Some(l1i);
+            l1p.right = Some(l1b);
+            out.left = Some(l1p);
+            println!("batch {} | {}", batch, loss);
 
 
 
         }
-        println!("Epoch {} | {}", epoch, total_loss)
+        println!("Epoch {} | {}", epoch, total_loss);
     }
 
     Ok(())
