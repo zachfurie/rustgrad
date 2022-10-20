@@ -1,5 +1,5 @@
 
-use std::{io, fs::File};
+use std::{io, fs::File, time::Instant};
 
 use rand::prelude::*;
 use csv;
@@ -333,8 +333,8 @@ fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
 	} else if root.op == "sm" { // Softmax
 		let a = forward(root.left.unwrap(), f_data);
 		for i in 0..a.tensor.l2() {
-			let mut layer_sum = 0.;
-			let mut layer_max = 0.000000001;
+			let mut layer_sum: f64 = 0.0;
+			let mut layer_max: f64 = 0.0000001;
 			// layer_max is for normalization
 			for j in 0..a.tensor.l() {
 				if a.tensor.get(vec![i, j]) > layer_max {
@@ -342,7 +342,7 @@ fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
 				}
 			}
 			for j in 0..a.tensor.l() {
-				layer_sum += a.tensor.get(vec![i, j]).exp() - layer_max;
+				layer_sum += (a.tensor.get(vec![i, j]) - layer_max).exp();
 			}
 			for j in 0..a.tensor.l() {
 				root.tensor.set(vec![i, j], a.tensor.get(vec![i, j]) - layer_sum.ln() - layer_max)
@@ -433,8 +433,9 @@ fn _simple(dim0: usize, dim1: usize) -> Box<Node> {
 }
 
 pub(crate) fn simple() -> std::io::Result<()> {
-    let batch_size = 512; //51200
+    let batch_size = 5120; //51200
     let lr = 0.001;
+    let epochs = 10;
 
     // read in data
     let file = File::open("mnist_train.csv")?;
@@ -444,21 +445,57 @@ pub(crate) fn simple() -> std::io::Result<()> {
         let record = result?;
         data.push(record);
     }
+
+    let file2 = File::open("mnist_test.csv")?;
+    let mut rdr2 = csv::Reader::from_reader(file2);
+    let mut data2: Vec<csv::StringRecord> = Vec::new();
+    for result in rdr2.records() {
+        let record = result?;
+        data2.push(record);
+    }
+
     let mut x_train = Vec::new();
     let mut y_train = Vec::new();
-    // let mut x_test = Vec::new();
-    // let mut y_test = Vec::new();
-    let d_i = 0;
+    let mut last_ind = 0;
     for b in 0..batch_size {
         let data_slice = &data[b];
         let mut x = Tensor::zeros(&vec![1,784]);
         let mut y = Tensor::zeros(&vec![1,10]);
         y.set(vec![0, data_slice[0].parse::<usize>().unwrap()], 1.0);
         for i in 1..x.data.len() {
-            x.set(vec![0,i-1], data_slice[i].parse::<f64>().unwrap());
+            x.set(vec![0,i-1], data_slice[i].parse::<f64>().unwrap() / 255.0);
         }
         x_train.push(x);
         y_train.push(y);
+        last_ind += 1;
+    }
+
+    let mut x_test = Vec::new();
+    let mut y_test = Vec::new();
+    for b in 0..(batch_size/10+1) {
+        let data_slice = &data[b + last_ind];
+        let mut x = Tensor::zeros(&vec![1,784]);
+        let mut y = Tensor::zeros(&vec![1,10]);
+        y.set(vec![0, data_slice[0].parse::<usize>().unwrap()], 1.0);
+        for i in 1..x.data.len() {
+            x.set(vec![0,i-1], data_slice[i].parse::<f64>().unwrap() / 255.0);
+        }
+        x_test.push(x);
+        y_test.push(y);
+    }
+
+    let mut x_val = Vec::new();
+    let mut y_val = Vec::new();
+    for b in 0..10000 {
+        let data_slice = &data2[b];
+        let mut x = Tensor::zeros(&vec![1,784]);
+        let mut y = Tensor::zeros(&vec![1,10]);
+        y.set(vec![0, data_slice[0].parse::<usize>().unwrap()], 1.0);
+        for i in 1..x.data.len() {
+            x.set(vec![0,i-1], data_slice[i].parse::<f64>().unwrap() / 255.0);
+        }
+        x_val.push(x);
+        y_val.push(y);
     }
 
     let mut out = _simple(1, 784);
@@ -470,22 +507,31 @@ pub(crate) fn simple() -> std::io::Result<()> {
         prev_m1s: prev_m1,
         prev_m2s: prev_m2,
     };
+    let mut step = 0.0;
+    let now_total = Instant::now();
     println!("======= START TRAINING ======");
-    for epoch in 0..10 {
+    for epoch in 0..epochs {
         let mut total_loss: f64 = 0.;
+        let now = Instant::now();
         for batch in 0..x_train.len() {
             let x = x_train[batch].copy_tens();
             let y = y_train[batch].copy_tens();
             // let zero_grad = Tensor::zeros(&out.grad.shape);
 			// out.grad = zero_grad;
-            // println!("forward");
             out = forward(out, &x);
-            // println!("loss");
+
+            // if batch == x_train.len() - 1 && epoch == epochs - 1 { 
+            //     let mut pred = out.tensor.copy_tens();
+            //     for p in 0..pred.l() {
+            //         pred.data[p] = (((pred.data[p]).exp() * 100.0) as u128) as f64 / 100.0;
+            //     }
+            //     println!(" y    | {:?}", &y.data);
+            //     println!(" pred | {:?}", pred.data);
+            // }
+
             let loss = nll_loss(&mut out, Box::new(y));
             total_loss += loss;
-            // println!("backward");
             out = backward(out);
-            // println!("params");
             let mut params: Vec<&mut Node> = Vec::new();
             let mut l1p = out.left.unwrap();
             let mut l1b = l1p.right.unwrap();
@@ -493,19 +539,66 @@ pub(crate) fn simple() -> std::io::Result<()> {
             let mut l1w = l1i.left.unwrap();
             params.push(l1b.as_mut());
             params.push(l1w.as_mut());
-            // println!("step");
             opt.step(&mut params, 1.0);
+            opt.exp_lr_decay(0.95, step, 10.0*(x_train.len() as f64));
+            step += 1.0;
             l1i.left = Some(l1w);
             l1p.left = Some(l1i);
             l1p.right = Some(l1b);
             out.left = Some(l1p);
-            println!("batch {} | {}", batch, loss);
-
-
-
         }
-        println!("Epoch {} | {}", epoch, total_loss);
+        let elapsed_time = now.elapsed();
+        total_loss = 0.0;
+        for t in 0..x_test.len() {
+            let x = x_test[t].copy_tens();
+            let y = y_test[t].copy_tens();
+            out = forward(out, &x);
+            let loss = nll_loss(&mut out, Box::new(y));
+            total_loss += loss;
+        }
+        println!("Epoch {} | {} | {:#?}", epoch, total_loss / (x_test.len() as f64), elapsed_time);
     }
+    println!("Total training time: {:#?}", now_total.elapsed());
+    let now_val = Instant::now();
+    println!("=====VALIDATING======");
+    let mut correct = 0;
+    let mut incorrect = 0;
+    let mut total_loss = 0.0;
+    for t in 0..x_val.len() {
+        let x = x_val[t].copy_tens();
+        let y = y_val[t].copy_tens();
+        out = forward(out, &x);
+
+        let mut max_pred = 0.0;
+        let mut max_ind = 0;
+        for p in 0..out.tensor.l() {
+            let temp = out.tensor.get(vec![0, p]).exp();
+            if temp > max_pred {
+                max_pred = temp;
+                max_ind = p;
+            }
+        }
+        let mut y_ind = 0;
+        for p in 0..y.l() {
+            if y.get(vec![0,p]) > 0.0 {
+                y_ind = p;
+                // break;
+            }
+        }
+        if max_ind == y_ind {
+            correct += 1;
+        } else {
+            incorrect += 1;
+        }
+
+        let loss = nll_loss(&mut out, Box::new(y));
+        total_loss += loss;
+    }
+    println!("Validation | {} | {:#?}", total_loss / (x_val.len() as f64), now_val.elapsed());
+    println!("Total correct:   {}", correct);
+    println!("Total incorrect: {}", incorrect);
+    let acc = (correct * 100 / (correct + incorrect)) as f64 / 100.0;
+    println!("Accuracy: {}%", acc);
 
     Ok(())
 }
