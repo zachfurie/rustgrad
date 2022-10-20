@@ -1,5 +1,5 @@
 
-use std::{io, fs::File, time::Instant};
+use std::{fs::File, time::Instant};
 
 use rand::prelude::*;
 use csv;
@@ -110,7 +110,7 @@ impl Tensor {
     }
 }
 
-fn add_same_size(dst: &mut Tensor, t: &Tensor ) {
+fn _add_same_size(dst: &mut Tensor, t: &Tensor ) {
     for (i,_) in t.data.iter().enumerate() {
         dst.data[i] += t.data[i]
     }
@@ -138,7 +138,7 @@ fn weight<'a>(shaper: Vec<usize>) -> Box<Node> {
 	Box::new(Node {
         left: None,
         right: None, 
-        op: "leaf", 
+        op: "param", 
         tensor: tens, 
         grad: zero_grad, 
         require_grad: true,
@@ -198,7 +198,7 @@ fn linear<'a>(inn: Box<Node>, out_dim: usize) -> Box<Node> { //  Node<'a>,  Node
 }
 
 // Log Softmax layer
-fn log_softmax<'a>(inn: Box<Node>) -> Box<Node> {
+fn log_softmax(inn: Box<Node>) -> Box<Node> {
 	let zero_grad = Tensor::ones(&inn.tensor.shape);
 	let data = Tensor::zeros(&inn.tensor.shape);
 	Box::new(Node {
@@ -211,12 +211,26 @@ fn log_softmax<'a>(inn: Box<Node>) -> Box<Node> {
     })
 }
 
+// Sigmoid layer
+fn sigmoid(inn: Box<Node>) -> Box<Node> {
+	let zero_grad = Tensor::ones(&inn.tensor.shape);
+	let data = Tensor::zeros(&inn.tensor.shape);
+	Box::new(Node {
+        left: Some(inn), 
+        right: None, 
+        op: "sig", 
+        tensor: data, 
+        grad: zero_grad, 
+        require_grad: true,
+    })
+}
+
 
 
 //  ----------------------------------- LOSS AND OPTIM:  -----------------------------------
 
 // Negative Log Likelihood. Takes prediction tensor and target tensor as inputs, returns loss, and updates gradients from input
-fn nll_loss(pred: &mut Box<Node>, target: Box<Tensor>) -> f64 { // mut gradients: Box<Tensor>
+fn nll_loss(pred: &mut Box<Node>, target: &Tensor) -> f64 { // mut gradients: Box<Tensor>
 	let mut loss = 0.0;
 	for j in 0..target.l2() {
 		for i in 0..target.l() {
@@ -239,7 +253,7 @@ struct Adam {
 
 impl Adam {
 // Adam Optimizer Step function
-    fn step(&mut self, weights:  &mut Vec<&mut Node>, bsz: f64) {
+    fn _step(&mut self, weights:  &mut Vec<&mut Node>, bsz: f64) {
         // parameters: would normally get these from adam_init, but keeping them here as defaults for now.
         let b1: f64 = 0.9;
         let b2: f64 = 0.999;
@@ -278,9 +292,81 @@ impl Adam {
         }
     }
 
+    fn init_prevs(&mut self, w: &Node) {
+        if w.op == "param" {
+            let p1 = Tensor::zeros(&w.grad.shape);
+            let p2 = Tensor::zeros(&w.grad.shape);
+            self.prev_m1s.push(p1);
+            self.prev_m2s.push(p2);
+        }
+        match &w.left {
+            Some(x) => {
+                self.init_prevs(x);
+            }
+            None => {}
+        }
+        match &w.right {
+            Some(x) => {
+                self.init_prevs(x);
+            }
+            None => {}
+        }
+    }
+    //create prev_m1s and prev_m2s with same recursive search pattern (DFS)
+    fn step(&mut self, w: &mut Node, bsz: f64, mut k: usize) -> usize {
+        // parameters: would normally get these from adam_init, but keeping them here as defaults for now.
+        let b1: f64 = 0.9;
+        let b2: f64 = 0.999;
+        let epsilon: f64 = 10.0_f64.powf(-8.0);
+        // ------------
+        // self.t += 1.0;
+        if w.op == "param" {
+            let t = self.t;
+            let alpha = self.alpha * (1. - b2.powf(t)).sqrt() / (1. - b1.powf(t));
+            let prev_m1 = &mut self.prev_m1s[k];
+            let prev_m2 = &mut self.prev_m2s[k];
+            for i in 0..w.grad.l2() {
+                for j in 0..w.grad.l() {
+                    w.grad.set(vec![i,j], w.grad.get(vec![i,j])/bsz); // get mean gradient of batch
+                    //-gradient--clipping-
+                    if w.grad.get(vec![i,j]) > 1.0 {
+                        w.grad.set(vec![i,j], 1.0);
+                    }
+                    if w.grad.get(vec![i,j]) < -1.0 {
+                        w.grad.set(vec![i,j], -1.0);
+                    }
+                    //-------------------
+                    let m1 = prev_m1.get(vec![i,j]);
+                    let m2 = prev_m2.get(vec![i,j]);
+                    let biased_m1 = (m1 * b1) + ((1. - b1) * w.grad.get(vec![i,j]));
+                    let biased_m2 = (m2 * b2) + ((1. - b2) * w.grad.get(vec![i,j]).powf(2.));
+                    w.tensor.set(vec![i,j], w.tensor.get(vec![i,j])-(alpha*biased_m1/(biased_m2.sqrt()+epsilon)));
+                    prev_m1.set(vec![i,j], biased_m1);
+                    prev_m2.set(vec![i,j], biased_m2);
+                }
+            }
+            k += 1
+        }
+        match &mut w.left {
+            Some(x) => {
+                // let mut left = x;
+                k = self.step(x, bsz, k);
+                // w.left = Some(x);
+            }
+            None => {}
+        }
+        match &mut w.right {
+            Some(x) => {
+                k = self.step(x, bsz, k);
+            }
+            None => {}
+        }
+        k
+    }
+
     // Exponential learning rate decay
-    fn exp_lr_decay(&mut self, decay_rate: f64, global_step: f64, decay_steps: f64) {
-        self.alpha = self.alpha * (decay_rate.powf(global_step/decay_steps))
+    fn exp_lr_decay(&mut self, initial_lr: f64, decay_rate: f64, global_step: f64, decay_steps: f64) {
+        self.alpha = initial_lr * (decay_rate.powf(global_step/decay_steps))
     }
 }
 
@@ -295,7 +381,7 @@ fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
     if root.op == "input" {
 		root.tensor = f_data.copy_tens();
         return root;
-	} else if root.op == "leaf" {
+	} else if root.op == "leaf" || root.op == "param" {
 		return root;
 	} else {
 		let zeroed_data = Tensor::zeros(&root.tensor.shape);
@@ -349,7 +435,15 @@ fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
 			}
 		}
         root.left = Some(a);
-	} 
+	} else if root.op == "sig" { // Sigmoid
+		let a = forward(root.left.unwrap(), f_data);
+		for i in 0..a.tensor.l2() {
+			for j in 0..a.tensor.l() {
+				root.tensor.set(vec![i, j], 1./(1. + (-1.*a.tensor.get(vec![i, j])).exp()));
+			}
+		}
+        root.left = Some(a);
+	}
     root
 }
 
@@ -407,11 +501,19 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
         root.left = Some(backward(a));
         root.right = Some(backward(x));
         root.tensor = data;
-	} else if root.op == "sm" { // Softmax
+	} else if root.op == "sm" { // Log Softmax
 		let mut a = root.left.unwrap();
 		for i in 0..root.tensor.l2() {
 			for j in 0..root.tensor.l() {
 				a.grad.set(vec![i, j], -1.*(root.grad.get(vec![i, j])-root.tensor.get(vec![i, j]).exp()))
+			}
+		}
+        root.left = Some(backward(a));
+	} else if root.op == "sig" { // Sigmoid
+		let mut a = root.left.unwrap();
+		for i in 0..root.tensor.l2() {
+			for j in 0..root.tensor.l() {
+				a.grad.set(vec![i, j], (root.tensor.get(vec![i, j]) * (1.0 - root.tensor.get(vec![i, j]) * root.grad.get(vec![i, j]))))
 			}
 		}
         root.left = Some(backward(a));
@@ -499,23 +601,27 @@ pub(crate) fn simple() -> std::io::Result<()> {
     }
 
     let mut out = _simple(1, 784);
-    let prev_m1 = vec![Tensor::zeros(&vec![1,10]), Tensor::zeros(&vec![10,784])];
-    let prev_m2 = vec![Tensor::zeros(&vec![1,10]), Tensor::zeros(&vec![10,784])];
+    // let prev_m1 = vec![Tensor::zeros(&vec![1,10]), Tensor::zeros(&vec![10,784])];
+    // let prev_m2 = vec![Tensor::zeros(&vec![1,10]), Tensor::zeros(&vec![10,784])];
     let mut opt = Adam {
         t: 0.0, 
         alpha: lr, 
-        prev_m1s: prev_m1,
-        prev_m2s: prev_m2,
+        prev_m1s: Vec::new(),
+        prev_m2s: Vec::new(),
     };
-    let mut step = 0.0;
+    opt.init_prevs(out.as_ref());
+    // let mut step = 0.0;
     let now_total = Instant::now();
+    let mut best_epoch = 0;
+    let mut best_epoch_loss = 999999.9;
+    let mut best_l1_weight = Tensor::zeros(&vec![10, 784]);
+    let mut best_l1_bias = Tensor::zeros(&vec![1, 10]);
     println!("======= START TRAINING ======");
     for epoch in 0..epochs {
-        let mut total_loss: f64 = 0.;
         let now = Instant::now();
         for batch in 0..x_train.len() {
-            let x = x_train[batch].copy_tens();
-            let y = y_train[batch].copy_tens();
+            let x = &x_train[batch]; //.copy_tens();
+            let y = &y_train[batch]; //.copy_tens();
             // let zero_grad = Tensor::zeros(&out.grad.shape);
 			// out.grad = zero_grad;
             out = forward(out, &x);
@@ -529,44 +635,74 @@ pub(crate) fn simple() -> std::io::Result<()> {
             //     println!(" pred | {:?}", pred.data);
             // }
 
-            let loss = nll_loss(&mut out, Box::new(y));
-            total_loss += loss;
+            nll_loss(&mut out, y);
             out = backward(out);
-            let mut params: Vec<&mut Node> = Vec::new();
+            // let mut params: Vec<&mut Node> = Vec::new();
+            // let mut l1p = out.left.unwrap();
+            // let mut l1b = l1p.right.unwrap();
+            // let mut l1i = l1p.left.unwrap();
+            // let mut l1w = l1i.left.unwrap();
+            // params.push(l1b.as_mut());
+            // params.push(l1w.as_mut());
+            opt.t += 1.0;
+            opt.step(out.as_mut(), 1.0, 0);
+            opt.exp_lr_decay(lr, 0.95, opt.t - 1.0, (epochs * x_train.len()) as f64);
+            // step += 1.0;
+            // l1i.left = Some(l1w);
+            // l1p.left = Some(l1i);
+            // l1p.right = Some(l1b);
+            // out.left = Some(l1p);
+        }
+        let elapsed_time = now.elapsed().as_secs();
+        let extra_seconds = elapsed_time % 60;
+        let mins = elapsed_time / 60;
+        let mut total_loss = 0.0;
+        for t in 0..x_test.len() {
+            let x = &x_test[t]; //.copy_tens();
+            let y = &y_test[t]; //.copy_tens();
+            out = forward(out, &x);
+            let loss = nll_loss(&mut out, y);
+            total_loss += loss;
+        }
+        println!("Epoch {} | {} | {} minutes {} seconds", epoch, total_loss / (x_test.len() as f64), mins, extra_seconds);
+        if total_loss < best_epoch_loss {
+            best_epoch_loss = total_loss;
+            best_epoch = epoch;
             let mut l1p = out.left.unwrap();
-            let mut l1b = l1p.right.unwrap();
+            let l1b = l1p.right.unwrap();
             let mut l1i = l1p.left.unwrap();
-            let mut l1w = l1i.left.unwrap();
-            params.push(l1b.as_mut());
-            params.push(l1w.as_mut());
-            opt.step(&mut params, 1.0);
-            opt.exp_lr_decay(0.95, step, 10.0*(x_train.len() as f64));
-            step += 1.0;
+            let l1w = l1i.left.unwrap();
+            best_l1_weight = l1w.tensor.copy_tens();
+            best_l1_bias = l1b.tensor.copy_tens();
             l1i.left = Some(l1w);
             l1p.left = Some(l1i);
             l1p.right = Some(l1b);
             out.left = Some(l1p);
         }
-        let elapsed_time = now.elapsed();
-        total_loss = 0.0;
-        for t in 0..x_test.len() {
-            let x = x_test[t].copy_tens();
-            let y = y_test[t].copy_tens();
-            out = forward(out, &x);
-            let loss = nll_loss(&mut out, Box::new(y));
-            total_loss += loss;
-        }
-        println!("Epoch {} | {} | {:#?}", epoch, total_loss / (x_test.len() as f64), elapsed_time);
     }
-    println!("Total training time: {:#?}", now_total.elapsed());
+    let total_elapsed = now_total.elapsed().as_secs();
+    let tot_extra_seconds = total_elapsed % 60;
+    let tot_mins = total_elapsed / 60;
+    println!("Total training time: {} minutes {} seconds", tot_mins, tot_extra_seconds);
+    println!("Best Epoch: {} | {}", best_epoch, best_epoch_loss);
     let now_val = Instant::now();
     println!("=====VALIDATING======");
+    let mut l1p = out.left.unwrap();
+    let mut l1b = l1p.right.unwrap();
+    let mut l1i = l1p.left.unwrap();
+    let mut l1w = l1i.left.unwrap();
+    l1w.tensor = best_l1_weight;
+    l1b.tensor = best_l1_bias;
+    l1i.left = Some(l1w);
+    l1p.left = Some(l1i);
+    l1p.right = Some(l1b);
+    out.left = Some(l1p);
     let mut correct = 0;
     let mut incorrect = 0;
     let mut total_loss = 0.0;
     for t in 0..x_val.len() {
-        let x = x_val[t].copy_tens();
-        let y = y_val[t].copy_tens();
+        let x = &x_val[t]; //.copy_tens();
+        let y = &y_val[t]; //.copy_tens();
         out = forward(out, &x);
 
         let mut max_pred = 0.0;
@@ -591,7 +727,7 @@ pub(crate) fn simple() -> std::io::Result<()> {
             incorrect += 1;
         }
 
-        let loss = nll_loss(&mut out, Box::new(y));
+        let loss = nll_loss(&mut out, y);
         total_loss += loss;
     }
     println!("Validation | {} | {:#?}", total_loss / (x_val.len() as f64), now_val.elapsed());
@@ -604,7 +740,7 @@ pub(crate) fn simple() -> std::io::Result<()> {
 }
 
 
-pub(crate) fn foward_test() {
+pub(crate) fn _foward_test() {
     let mut a = Tensor::xavier(&vec![2,2]);
     let mut x = Tensor::xavier(&vec![2,2]);
 
@@ -629,14 +765,14 @@ pub(crate) fn foward_test() {
     println!("a: {:?}", x.data);
     println!("x: {:?}", x.data);
     let in1 = leaf(a, false);
-    let in2 = leaf(x, false);
-    let l1 = linear(in1, 10);
+    let _in2 = leaf(x, false);
+    let _l1 = linear(in1, 10);
     // println!("l1: {:?}", forward(l1, x).tensor.data);
 
 }
 
 
-pub(crate) fn test() {
+pub(crate) fn _test() {
     let s: Vec<usize> = vec![2,2];
     let mut a = Tensor::xavier(&s);
     let mut b = a.copy_tens();
@@ -662,7 +798,7 @@ pub(crate) fn test() {
     println!("{} {}", b.get(ind1), b.get(ind2));
     println!("{} {}", b.get(ind3), b.get(ind4));
 
-    add_same_size(&mut b, &a);
+    _add_same_size(&mut b, &a);
 
     let ind1 = vec![0,0];
     let ind2 = vec![0,1];
