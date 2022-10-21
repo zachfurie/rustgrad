@@ -1,21 +1,19 @@
 
 use std::{fs::File, time::Instant};
-
 use rand::prelude::*;
 use csv;
 
 // ----------------------------------- Notes:  ----------------------------------------------
 
-// Need to reset random seed!!!
-
+// Need to reset random seed
+// implement parallelism
+// Maybe use mutable arrays instead of vecs
 
 //  ----------------------------------- Data Structures:  -----------------------------------
 
 struct Node {
     left: Option<Box<Node>>,
 	right: Option<Box<Node>>,
-    // left: Option<&'a Node<'a>>,
-	// right: Option<&'a Node<'a>>,
 	op: &'static str,
 	tensor: Tensor,
 	grad: Tensor,
@@ -25,6 +23,7 @@ struct Node {
 struct Tensor {
 	data:  Vec<f64>, // Float64 all tensor data in a single slice 
 	shape: Vec<usize>, // Int  [i] = length of dimension i
+    diminc: Vec<usize>,
 }
 
 //  ----------------------------------- Auxiliary Functions:  -----------------------------------
@@ -32,36 +31,69 @@ struct Tensor {
 impl Tensor {
     fn zeros(shaper: &Vec<usize>) -> Tensor {
         let mut data_len: usize = 1;
-        for i in shaper {
-            data_len *= i
+        let mut incs = vec![0; shaper.len()];
+        for i in 0..shaper.len() {
+            data_len *= shaper[i];
+            if i == shaper.len()-1 {
+                incs[i] = 1;
+            } else {
+                let mut temp = 1;
+                for ii in i + 1..shaper.len() {
+                    temp *= shaper[ii]
+                }
+                incs[i] = temp 
+            }
         }
         Tensor {
             data:  vec![0.; data_len], // all tensor data in a single slice 
-            shape: shaper.to_vec() // [i] = length of dimension i
+            shape: shaper.to_vec(), // [i] = length of dimension i
+            diminc: incs,
         }
     }
 
     fn ones(shaper: &Vec<usize>) -> Tensor {
         let mut data_len: usize = 1;
-        for i in shaper {
-            data_len *= i
+        let mut incs = vec![0; shaper.len()];
+        for i in 0..shaper.len() {
+            data_len *= shaper[i];
+            if i == shaper.len()-1 {
+                incs[i] = 1;
+            } else {
+                let mut temp = 1;
+                for ii in i + 1..shaper.len() {
+                    temp *= shaper[ii]
+                }
+                incs[i] = temp 
+            }
         }
         Tensor {
             data:  vec![1.; data_len], // all tensor data in a single slice 
-            shape: shaper.to_vec() // [i] = length of dimension i
+            shape: shaper.to_vec(), // [i] = length of dimension i
+            diminc: incs
         }
     }
 
     fn xavier(shaper: &Vec<usize>) -> Tensor {
         let mut data_len: usize = 1;
-        for i in shaper {
-            data_len *= i
+        let mut incs = vec![0; shaper.len()];
+        for i in 0..shaper.len() {
+            data_len *= shaper[i];
+            if i == shaper.len()-1 {
+                incs[i] = 1;
+            } else {
+                let mut temp = 1;
+                for ii in i + 1..shaper.len() {
+                    temp *= shaper[ii]
+                }
+                incs[i] = temp 
+            }
         }
         let std = (shaper[shaper.len()-1] as f64).sqrt();
         let mut rng = rand::thread_rng();
         let mut t = Tensor {
             data:  vec![1.; data_len], // all tensor data in a single slice 
-            shape: shaper.to_vec() // [i] = length of dimension i
+            shape: shaper.to_vec(), // [i] = length of dimension i
+            diminc: incs,
         };
         for i in 0..data_len {
             let y: f64 = rng.gen(); // generates a float between 0 and 1
@@ -76,19 +108,17 @@ impl Tensor {
 
     fn get(&self, ind: Vec<usize>) -> f64 {
         let mut index = 0;
-        for (i,x) in ind[..ind.len()-1].iter().enumerate() {
-            index += self.shape[i+1] * x
+        for (i,x) in ind.iter().enumerate() {
+            index += self.diminc[i] * x;
         };
-        index += ind[ind.len()-1];
         self.data[index]
     }
     
     fn set(&mut self, ind: Vec<usize>, elem: f64) {
         let mut index = 0;
-        for (i,x) in ind[..ind.len()-1].iter().enumerate() {
-            index += self.shape[i+1] * x
+        for (i,x) in ind.iter().enumerate() {
+            index += self.diminc[i] * x;
         };
-        index += ind[ind.len()-1];
         self.data[index] = elem;
     }
 
@@ -103,9 +133,11 @@ impl Tensor {
     fn copy_tens(&self) -> Tensor {
         let new_shape = self.shape.to_vec();
         let new_data = self.data.to_vec();
+        let new_incs = self.diminc.to_vec();
         Tensor {
             data:  new_data, // all tensor data in a single slice 
             shape: new_shape, // [i] = length of dimension i
+            diminc: new_incs,
         }
     }
 }
@@ -173,19 +205,6 @@ fn matmul(a: Box<Node>, x: Box<Node>) -> Box<Node> {
     })
 }
 
-// fn matmul<'a>(a: &'a Node, x: &'a Node) -> Node<'a> {
-// 	let zero_grad = Tensor::ones(&vec![x.tensor.l2(), a.tensor.l2()]);
-// 	let data = Tensor::zeros(&vec![x.tensor.l2(), a.tensor.l2()]);
-// 	Node{
-//         left: Some(&a), 
-//         right: Some(&x), 
-//         op: "mm", 
-//         tensor: data, 
-//         grad: zero_grad, 
-//         require_grad: true,
-//     }
-// }
-
 //  ----------------------------------- ML OPS:  -----------------------------------
 
 // Linear layer. Returns output, weight, bias so that weight and bias can be put in params[].
@@ -225,8 +244,6 @@ fn sigmoid(inn: Box<Node>) -> Box<Node> {
     })
 }
 
-
-
 //  ----------------------------------- LOSS AND OPTIM:  -----------------------------------
 
 // Negative Log Likelihood. Takes prediction tensor and target tensor as inputs, returns loss, and updates gradients from input
@@ -253,45 +270,6 @@ struct Adam {
 
 impl Adam {
 // Adam Optimizer Step function
-    fn _step(&mut self, weights:  &mut Vec<&mut Node>, bsz: f64) {
-        // parameters: would normally get these from adam_init, but keeping them here as defaults for now.
-        let b1: f64 = 0.9;
-        let b2: f64 = 0.999;
-        let epsilon: f64 = 10.0_f64.powf(-8.0);
-        // ------------
-        self.t += 1.0;
-        let t = self.t;
-        let alpha = self.alpha * (1. - b2.powf(t)).sqrt() / (1. - b1.powf(t));
-        for k in 0..weights.len() {
-            let w = &mut weights[k];
-            if !w.require_grad {
-                continue
-            }
-            let prev_m1 = &mut self.prev_m1s[k];
-            let prev_m2 = &mut self.prev_m2s[k];
-            for i in 0..w.grad.l2() {
-                for j in 0..w.grad.l() {
-                    w.grad.set(vec![i,j], w.grad.get(vec![i,j])/bsz); // get mean gradient of batch
-                    //-gradient--clipping-
-                    if w.grad.get(vec![i,j]) > 1.0 {
-                        w.grad.set(vec![i,j], 1.0);
-                    }
-                    if w.grad.get(vec![i,j]) < -1.0 {
-                        w.grad.set(vec![i,j], -1.0);
-                    }
-                    //-------------------
-                    let m1 = prev_m1.get(vec![i,j]);
-                    let m2 = prev_m2.get(vec![i,j]);
-                    let biased_m1 = (m1 * b1) + ((1. - b1) * w.grad.get(vec![i,j]));
-                    let biased_m2 = (m2 * b2) + ((1. - b2) * w.grad.get(vec![i,j]).powf(2.));
-                    w.tensor.set(vec![i,j], w.tensor.get(vec![i,j])-(alpha*biased_m1/(biased_m2.sqrt()+epsilon)));
-                    prev_m1.set(vec![i,j], biased_m1);
-                    prev_m2.set(vec![i,j], biased_m2);
-                }
-            }
-        }
-    }
-
     fn init_prevs(&mut self, w: &Node) {
         if w.op == "param" {
             let p1 = Tensor::zeros(&w.grad.shape);
@@ -493,7 +471,7 @@ fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
 		let a = forward(root.left.unwrap(), f_data);
 		for i in 0..a.tensor.l2() {
 			for j in 0..a.tensor.l() {
-				root.tensor.set(vec![i, j], 1./(1. + (-1.*a.tensor.get(vec![i, j])).exp()));
+				root.tensor.set(vec![i, j], 1.0/(1.0 + (-1.0*a.tensor.get(vec![i, j])).exp()));
 			}
 		}
         root.left = Some(a);
@@ -560,7 +538,7 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
 		let mut a = root.left.unwrap();
 		for i in 0..root.tensor.l2() {
 			for j in 0..root.tensor.l() {
-				a.grad.set(vec![i, j], root.tensor.get(vec![i, j]) * (1.0 - root.tensor.get(vec![i, j]) * root.grad.get(vec![i, j])));
+				a.grad.set(vec![i, j], root.tensor.get(vec![i, j]) * (1.0 - root.tensor.get(vec![i, j])) * root.grad.get(vec![i, j]));
 			}
 		}
         root.left = Some(backward(a));
@@ -577,16 +555,16 @@ fn _simple(dim0: usize, dim1: usize) -> Box<Node> {
     let x_placeholder = Tensor::zeros(&vec![dim0, dim1]);
 	let mut x_node = leaf(x_placeholder, false);
     x_node.op = "input";
-    let l1 = linear(x_node, 64);
+    let l1 = linear(x_node, 10);
     let s1 = sigmoid(l1);
     let l2 = linear(s1, 10);
     log_softmax(l2)
 }
 
 pub(crate) fn simple() -> std::io::Result<()> {
-    let batch_size = 512; //51200
+    let batch_size = 5120; //51200
     let lr = 0.001;
-    let epochs = 5;
+    let epochs = 10;
 
     // read in data
     let file = File::open("mnist_train.csv")?;
@@ -665,11 +643,15 @@ pub(crate) fn simple() -> std::io::Result<()> {
     println!("======= START TRAINING ======");
     for epoch in 0..epochs {
         let now = Instant::now();
+        let mut for_tot = 0;
+        let mut bac_tot = 0;
+        let mut step_tot = 0;
         for batch in 0..x_train.len() {
             let x = &x_train[batch]; 
             let y = &y_train[batch];
+            let for_time = Instant::now();
             out = forward(out, &x);
-
+            for_tot += for_time.elapsed().as_millis();
             // if batch == x_train.len() - 1 && epoch == epochs - 1 { 
             //     let mut pred = out.tensor.copy_tens();
             //     for p in 0..pred.l() {
@@ -680,10 +662,14 @@ pub(crate) fn simple() -> std::io::Result<()> {
             // }
 
             nll_loss(&mut out, y);
+            let bac_time = Instant::now();
             out = backward(out);
+            bac_tot += bac_time.elapsed().as_millis();
             opt.t += 1.0;
+            let step_time = Instant::now();
             opt.step(out.as_mut(), 1.0, 0);
-            opt.exp_lr_decay(lr, 0.95, opt.t - 1.0, (epochs * x_train.len()) as f64);
+            step_tot += step_time.elapsed().as_millis();
+            // opt.exp_lr_decay(lr, 0.95, opt.t - 1.0, (epochs * x_train.len()) as f64);
         }
         let elapsed_time = now.elapsed().as_secs();
         let extra_seconds = elapsed_time % 60;
@@ -702,7 +688,11 @@ pub(crate) fn simple() -> std::io::Result<()> {
             best_epoch = epoch;
             save_best(best_params.as_mut(), out.as_mut(), 0);
         }
+        println!("forward time: {:#?} milliseconds", for_tot);
+        println!("backward time: {:#?} milliseconds", bac_tot);
+        println!("step time: {:#?} milliseconds", step_tot);
     }
+   
     let total_elapsed = now_total.elapsed().as_secs();
     let tot_extra_seconds = total_elapsed % 60;
     let tot_mins = total_elapsed / 60;
@@ -753,6 +743,16 @@ pub(crate) fn simple() -> std::io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn get_test() {
+    let mut a = Tensor::ones(&vec![10,10]);
+    let mut t = Instant::now();
+    for i in 0..10000000 {
+        let b = a.get(vec![8,8]);
+        a.set(vec![0,0], 10.0);
+    }
+    let tot = t.elapsed().as_millis();
+    println!("{} ms", tot )
+}
 
 pub(crate) fn _foward_test() {
     let mut a = Tensor::xavier(&vec![2,2]);

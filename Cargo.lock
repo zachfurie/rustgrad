@@ -125,6 +125,7 @@ version = "0.1.0"
 dependencies = [
  "csv",
  "rand",
+ "rand_chacha",
 ]
 
 [[package]]
