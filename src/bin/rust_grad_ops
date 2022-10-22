@@ -957,7 +957,7 @@ fn _simple(dim0: usize, dim1: usize) -> Box<Node> {
 
 pub(crate) fn simple() -> std::io::Result<()> {
     let dataset_size = 51200; //51200
-    let batch_size = 1;
+    let batch_size = 32;
     let lr = 0.001;//0.001;
     let epochs = 20;
 

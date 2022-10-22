@@ -24,6 +24,10 @@ fn _simple(dim0: usize, dim1: usize) -> Box<Node> {
 
 let mut out = _simple(1, 784);
 
+let batch_size = 32;
+let lr = 0.001; 
+let epochs = 20;
+
 // Optimizer
 let mut opt = Adam {
     t: 0.0, 
@@ -62,7 +66,7 @@ for epoch in 0..epochs {
         let loss = nll_loss(&mut out, y);
         total_loss += loss;
     }
-    
+
     if total_loss < best_epoch_loss {
         best_epoch_loss = total_loss;
         best_epoch = epoch;
