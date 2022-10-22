@@ -143,6 +143,14 @@ impl Tensor {
         };
         self.data[index]
     }
+
+    fn _get_help(&self, ind: &[usize]) -> usize {
+        let mut index = 0;
+        for (i,x) in ind.iter().enumerate() {
+            index += self.diminc[i] * x;
+        };
+        index
+    }
     
     fn set(&mut self, ind: &[usize], elem: f64) {
         let mut index = 0;
@@ -336,9 +344,9 @@ fn dropout(inn: Box<Node>, drop_prob: f64) -> Box<Node> {
 
 // Conv2D
 fn conv2d(a: Box<Node>, conv_size: Vec<usize>, filters: usize) -> Box<Node> {
-    let x = weight(vec![filters, conv_size[0], conv_size[1]]);
-	let zero_grad = Tensor::ones(&vec![filters, 1 + a.tensor.l2() - x.tensor.l2(), 1 + a.tensor.l() - x.tensor.l()]);
-	let data = Tensor::zeros(&vec![filters, 1 + a.tensor.l2() - x.tensor.l2(), 1 + a.tensor.l() - x.tensor.l()]);
+    let x = weight(vec![conv_size[0], conv_size[1], filters]);
+	let zero_grad = Tensor::ones(&vec![1 + a.tensor.l2() - x.tensor.shape[0], 1 + a.tensor.l() - x.tensor.l2(), filters]);
+	let data = Tensor::zeros(&vec![1 + a.tensor.l2() - x.tensor.shape[0], 1 + a.tensor.l() - x.tensor.l2(), filters]);
 	Box::new(Node{
         left: Some(a), 
         right: Some(x), 
@@ -436,33 +444,61 @@ impl Adam {
             let alpha = self.alpha * (1. - b2.powf(t)).sqrt() / (1. - b1.powf(t));
             let prev_m1 = &mut self.prev_m1s[k];
             let prev_m2 = &mut self.prev_m2s[k];
-            for i in 0..w.grad.l2() {
-                for j in 0..w.grad.l() {
-                    w.grad.set( &[i,j], w.grad.get( &[i,j])/bsz); // get mean gradient of batch
-                    //-gradient--clipping-
-                    if w.grad.get( &[i,j]) > 1.0 {
-                        w.grad.set( &[i,j], 1.0);
+            // println!("m1 {:?}", prev_m1.shape);
+            // println!("m2 {:?}", prev_m2.shape);
+            // println!("grad {:?}", w.grad.shape);
+            if w.grad.shape.len() == 2 {
+                for i in 0..w.grad.l2() {
+                    for j in 0..w.grad.l() {
+                        w.grad.set( &[i,j], w.grad.get( &[i,j])/bsz); // get mean gradient of batch
+                        //-gradient--clipping-
+                        if w.grad.get( &[i,j]) > 1.0 {
+                            w.grad.set( &[i,j], 1.0);
+                        }
+                        if w.grad.get( &[i,j]) < -1.0 {
+                            w.grad.set( &[i,j], -1.0);
+                        }
+                        //-------------------
+                        let m1 = prev_m1.get( &[i,j]);
+                        let m2 = prev_m2.get( &[i,j]);
+                        let biased_m1 = (m1 * b1) + ((1. - b1) * w.grad.get( &[i,j]));
+                        let biased_m2 = (m2 * b2) + ((1. - b2) * w.grad.get( &[i,j]).powf(2.));
+                        w.tensor.set( &[i,j], w.tensor.get( &[i,j])-(alpha*biased_m1/(biased_m2.sqrt()+epsilon)));
+                        prev_m1.set( &[i,j], biased_m1);
+                        prev_m2.set( &[i,j], biased_m2);
                     }
-                    if w.grad.get( &[i,j]) < -1.0 {
-                        w.grad.set( &[i,j], -1.0);
+                }
+            } else {
+                for k in 0..w.grad.shape[0] {
+                    for i in 0..w.grad.l2() {
+                        for j in 0..w.grad.l() {
+                            // println!("tot: {}, k: {}, i: {}, j: {}", prev_m1._get_help(&[k,i,j]), k, i, j);
+                            w.grad.set( &[k,i,j], w.grad.get( &[k,i,j])/bsz); // get mean gradient of batch
+                            //-gradient--clipping-
+                            if w.grad.get( &[k,i,j]) > 1.0 {
+                                w.grad.set( &[k,i,j], 1.0);
+                            }
+                            if w.grad.get( &[k,i,j]) < -1.0 {
+                                w.grad.set( &[k,i,j], -1.0);
+                            }
+                            //-------------------
+                            let m1 = prev_m1.get( &[k,i,j]);
+                            let m2 = prev_m2.get( &[k,i,j]);
+                            let biased_m1 = (m1 * b1) + ((1. - b1) * w.grad.get( &[k,i,j]));
+                            let biased_m2 = (m2 * b2) + ((1. - b2) * w.grad.get( &[k,i,j]).powf(2.));
+                            w.tensor.set( &[k,i,j], w.tensor.get( &[k,i,j])-(alpha*biased_m1/(biased_m2.sqrt()+epsilon)));
+                            prev_m1.set( &[k,i,j], biased_m1);
+                            prev_m2.set( &[k,i,j], biased_m2);
+                        }
                     }
-                    //-------------------
-                    let m1 = prev_m1.get( &[i,j]);
-                    let m2 = prev_m2.get( &[i,j]);
-                    let biased_m1 = (m1 * b1) + ((1. - b1) * w.grad.get( &[i,j]));
-                    let biased_m2 = (m2 * b2) + ((1. - b2) * w.grad.get( &[i,j]).powf(2.));
-                    w.tensor.set( &[i,j], w.tensor.get( &[i,j])-(alpha*biased_m1/(biased_m2.sqrt()+epsilon)));
-                    prev_m1.set( &[i,j], biased_m1);
-                    prev_m2.set( &[i,j], biased_m2);
                 }
             }
             k += 1
         }
+        // println!("op {}", w.op);
         match &mut w.left {
             Some(x) => {
-                // let mut left = x;
                 k = self.step(x, bsz, k);
-                // w.left = Some(x);
             }
             None => {}
         }
@@ -617,6 +653,7 @@ fn batch(step: usize, grads: &mut Vec<Tensor>, w: &mut Node, opt: &mut Adam, bsz
 
 // Forward Pass function. Recursively finds leaf nodes and gets their values, then performs calculations at each node until it gets back to the root (the output layer).
 fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
+    // println!("op {} start", root.op);
     if root.op == "input" {
 		root.tensor = f_data.copy_tens();
         return root;
@@ -714,16 +751,15 @@ fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
         let mut data = root.tensor;
         // println!("a {:?}", a.tensor.shape);
         // println!("x {:?}", x.tensor.shape);
-        for m in 0..(x.tensor.shape[0]) {
-            for l in 0..(1 + a.tensor.l2() - x.tensor.l2()) {
-                for k in 0..(1 + a.tensor.l() - x.tensor.l()) {
-                    for i in 0..x.tensor.l2() {
-                        for j in 0..x.tensor.l() {
-                            // println!("a: [{},{}], x: [{},{},{}], root: [{},{},{}]", i+l,j+k,m, i,j, m,l, k);
-                        
-                            let temp2 = a.tensor.get( &[i+l,j+k]) * x.tensor.get(&[m, i, j]);
-                            let temp = data.get(&[m, l, k]) + temp2;
-                            data.set(&[m, l, k], temp);
+        for m in 0..(x.tensor.l()) {
+            for l in 0..(1 + a.tensor.l2() - x.tensor.shape[0]) {
+                for k in 0..(1 + a.tensor.l() - x.tensor.l2()) {
+                    for i in 0..x.tensor.shape[0] {
+                        for j in 0..x.tensor.l2() {
+                            // println!("a: [{},{}], x: [{},{},{}], root: [{},{},{}]", i+l,j+k, i,j, m,l, k, m);
+                            let temp2 = a.tensor.get( &[i+l,j+k]) * x.tensor.get(&[i, j, m]);
+                            let temp = data.get(&[l, k, m]) + temp2;
+                            data.set(&[l, k, m], temp);
                         }
                             
                     }
@@ -741,28 +777,29 @@ fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
     } else if root.op == "mp" {
         let a = forward(root.left.unwrap(), f_data);
         let mut data = root.tensor;
-        let l2dif = a.tensor.l2() - data.l2();
-        let ldif = a.tensor.l() - data.l();
+        let l2dif = a.tensor.shape[0] - data.l2();
+        let ldif = a.tensor.l2() - data.l();
         for l in 0..data.l2() {
             for k in 0..data.l() {
-                let mut max = 0.0;
-                for m in 0..a.tensor.shape[0] {
+                for m in 0..a.tensor.l() {
+                    let mut max = 0.0;
                     for i in 0..(1 + l2dif) {
                         for j in 0..(1+ ldif) {
                             // println!("a: [{},{}], root: [{},{}]", i+ l,j+ k, l, k);
-                            let temp = a.tensor.get(&[m, i + l, j+ k]);
+                            let temp = a.tensor.get(&[i + l, j+ k, m]);
                             if temp > max {
                                 max = temp;
                             }
                         }
                     }
+                    data.set(&[l, k, m], max);
                 }
-                data.set(&[l, k], max);
             }
         }
         root.left = Some(a);
         root.tensor = data;
     }
+    // println!("op {} end", root.op);
     root
 }
 
@@ -841,16 +878,16 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
     } else if root.op == "c2d" {
         let mut a = root.left.unwrap();
         let mut x = root.right.unwrap();
-        for m in 0..(x.tensor.shape[0]) {
-            for l in 0..(1 + a.tensor.l2() - x.tensor.l2()) {
-                for k in 0..(1 + a.tensor.l() - x.tensor.l()) {
-                    for i in 0..x.tensor.l2() {
-                        for j in 0..x.tensor.l() {
-                            let rootgrad = root.grad.get( &[m, l, k]);
-                            let t1 = a.grad.get( &[i + l, j + k]) + (x.tensor.get( &[m, i, j]) * rootgrad);
-                            let t2 = x.grad.get( &[m, i, j]) + (a.tensor.get( &[i + l, j + k]) * rootgrad);
+        for m in 0..(x.tensor.l()) {
+            for l in 0..(1 + a.tensor.l2() - x.tensor.shape[0]) {
+                for k in 0..(1 + a.tensor.l() - x.tensor.l2()) {
+                    for i in 0..x.tensor.shape[0] {
+                        for j in 0..x.tensor.l2() {
+                            let rootgrad = root.grad.get( &[l, k, m]);
+                            let t1 = a.grad.get( &[i + l, j + k]) + (x.tensor.get( &[i, j, m]) * rootgrad);
+                            let t2 = x.grad.get( &[i, j, m]) + (a.tensor.get( &[i + l, j + k]) * rootgrad);
                             a.grad.set( &[i + l, j + k], t1);
-                            x.grad.set( &[m, i, j], t2);
+                            x.grad.set( &[i, j, m], t2);
                         }
                     }
                 }
@@ -866,20 +903,20 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
         root.left = Some(a);
     } else if root.op == "mp" {
         let mut a = root.left.unwrap();
-        let l2dif = a.tensor.l2() - root.tensor.l2();
-        let ldif = a.tensor.l() - root.tensor.l();
+        let l2dif = a.tensor.shape[0] - root.tensor.l2();
+        let ldif = a.tensor.l2() - root.tensor.l();
         for l in 0..root.tensor.l2() {
             for k in 0..root.tensor.l() {
                 let mut max = 0.0;
                 let mut maxind = [0,0,0];
-                for m in 0..a.tensor.shape[0] {
+                for m in 0..a.tensor.l2() {
                     for i in 0..(1 + l2dif) {
                         for j in 0..(1+ ldif) {
                             // println!("a: [{},{}], root: [{},{}]", i+ l,j+ k, l, k);
-                            let temp = a.tensor.get(&[m, i + l, j+ k]);
+                            let temp = a.tensor.get(&[ i + l, j+ k, m]);
                             if temp > max {
                                 max = temp;
-                                maxind = [m, i + l, j+ k];
+                                maxind = [i + l, j+ k, m];
                             }
                         }
                     }
@@ -906,33 +943,21 @@ fn _simple(dim0: usize, dim1: usize) -> Box<Node> {
     // let l2 = linear(d1, 10);
 
     let r1 = reshape_node(x_node, vec![28,28]);
-    let c1 = conv2d(r1, vec![5,5], 32);
-    let m1 = max_pool(c1, vec![11,11]);
-    let re1 = relu(m1);
-    let d1 = dropout(re1,0.2);
-    let r2 = reshape_node(d1, vec![1,121]);
-    let l1 = linear(r2, 128);
-    let s1 = sigmoid(l1);
+    let c1 = conv2d(r1, vec![5,5], 10);
+    let m1 = max_pool(c1, vec![12,12,10]);
+    let r2 = reshape_node(m1, vec![1,1440]);
+    // let re1 = relu(r2);
+    // let d1 = dropout(re1,0.2);
+    // let l1 = linear(r2, 128);
+    let s1 = sigmoid(r2);
     let l2 = linear(s1, 10);
-    // let d1 = dropout(m1, 0.1);
-    
-    // let r2 = reshape_node(s1, vec![1,784]);
-    // let l1 = linear(s1, 10);
-
-    // let c1 = conv2d(r1, vec![25,25]);
-    // let re1 = relu(c1);
-    // let c2 = conv2d(c1, vec![20,20]);
-    // let re2 = relu(c2);
-    // let c3 = conv2d(r1, vec![2,5]);
-    // let r2 = reshape_node(c3, vec![1,10]);
-    // let l1 = linear(r2, 10);
 
     log_softmax(l2)
 }
 
 pub(crate) fn simple() -> std::io::Result<()> {
-    let dataset_size = 5120; //51200
-    let batch_size = 64;
+    let dataset_size = 51200; //51200
+    let batch_size = 1;
     let lr = 0.001;//0.001;
     let epochs = 20;
 
@@ -1038,14 +1063,25 @@ pub(crate) fn simple() -> std::io::Result<()> {
         let extra_seconds = elapsed_time % 60;
         let mins = elapsed_time / 60;
         let mut total_loss = 0.0;
-        for t in 0..x_test.len() {
-            let x = &x_test[t]; 
-            let y = &y_test[t]; 
+
+        for t in 0..x_train.len() {
+            let x = &x_train[t]; 
+            let y = &y_train[t]; 
             out = forward(out, &x);
             let loss = nll_loss(&mut out, y);
             total_loss += loss;
         }
-        println!("Epoch {} | {} | {} minutes {} seconds", epoch, total_loss / (x_test.len() as f64), mins, extra_seconds);
+        println!("Epoch {} | {} | {} minutes {} seconds", epoch, total_loss / (x_train.len() as f64), mins, extra_seconds);
+        
+
+        // for t in 0..x_test.len() {
+        //     let x = &x_test[t]; 
+        //     let y = &y_test[t]; 
+        //     out = forward(out, &x);
+        //     let loss = nll_loss(&mut out, y);
+        //     total_loss += loss;
+        // }
+        // println!("Epoch {} | {} | {} minutes {} seconds", epoch, total_loss / (x_test.len() as f64), mins, extra_seconds);
         if total_loss < best_epoch_loss {
             best_epoch_loss = total_loss;
             best_epoch = epoch;
