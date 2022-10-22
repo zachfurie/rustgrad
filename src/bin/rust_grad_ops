@@ -336,10 +336,9 @@ fn dropout(inn: Box<Node>, drop_prob: f64) -> Box<Node> {
 
 // Conv2D
 fn conv2d(a: Box<Node>, conv_size: Vec<usize>, filters: usize) -> Box<Node> {
-    // let x = weight(conv_size);
-	let zero_grad = Tensor::ones(&vec![filters, conv_size[0], conv_size[1]]);
-	let data = Tensor::zeros(&vec![filters, conv_size[0], conv_size[1]]);
-    let x = weight(vec![filters, 1 + a.tensor.l2() - data.l2(), 1 + a.tensor.l() - data.l()]);
+    let x = weight(vec![filters, conv_size[0], conv_size[1]]);
+	let zero_grad = Tensor::ones(&vec![filters, 1 + a.tensor.l2() - x.tensor.l2(), 1 + a.tensor.l() - x.tensor.l()]);
+	let data = Tensor::zeros(&vec![filters, 1 + a.tensor.l2() - x.tensor.l2(), 1 + a.tensor.l() - x.tensor.l()]);
 	Box::new(Node{
         left: Some(a), 
         right: Some(x), 
@@ -907,14 +906,18 @@ fn _simple(dim0: usize, dim1: usize) -> Box<Node> {
     // let l2 = linear(d1, 10);
 
     let r1 = reshape_node(x_node, vec![28,28]);
-    let c1 = conv2d(r1, vec![25,25], 10);
-    let m1 = max_pool(c1, vec![1,10]);
-    let s1 = sigmoid(m1);
+    let c1 = conv2d(r1, vec![5,5], 32);
+    let m1 = max_pool(c1, vec![11,11]);
+    let re1 = relu(m1);
+    let d1 = dropout(re1,0.2);
+    let r2 = reshape_node(d1, vec![1,121]);
+    let l1 = linear(r2, 128);
+    let s1 = sigmoid(l1);
+    let l2 = linear(s1, 10);
     // let d1 = dropout(m1, 0.1);
-    // let l1 = linear(s2, 10);
+    
     // let r2 = reshape_node(s1, vec![1,784]);
-    let l1 = linear(s1, 10);
-    let s2 = sigmoid(l1);
+    // let l1 = linear(s1, 10);
 
     // let c1 = conv2d(r1, vec![25,25]);
     // let re1 = relu(c1);
@@ -924,14 +927,14 @@ fn _simple(dim0: usize, dim1: usize) -> Box<Node> {
     // let r2 = reshape_node(c3, vec![1,10]);
     // let l1 = linear(r2, 10);
 
-    log_softmax(s2)
+    log_softmax(l2)
 }
 
 pub(crate) fn simple() -> std::io::Result<()> {
     let dataset_size = 5120; //51200
     let batch_size = 64;
     let lr = 0.001;//0.001;
-    let epochs = 10;
+    let epochs = 20;
 
 // ========== read in data =============================
     let file = File::open("mnist_train.csv")?;
