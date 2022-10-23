@@ -856,17 +856,17 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
         let mut a = root.left.unwrap();
 		let mut x = root.right.unwrap();
 
-		for i in 0..a.tensor.l2() {
-            for k in 0..x.tensor.l2() {
-                for j in 0..a.tensor.l() {
-                    let rootgrad = root.grad.get( &[k, i]);
-					let t1 = a.grad.get( &[i, j]) + (x.tensor.get( &[k, j]) * rootgrad);
-					let t2 = x.grad.get( &[k, j]) + (a.tensor.get( &[i, j]) * rootgrad);
-					a.grad.set( &[i, j], t1);
-					x.grad.set( &[k, j], t2);
-                }
-            }
-		}
+		// for i in 0..a.tensor.l2() {
+        //     for k in 0..x.tensor.l2() {
+        //         for j in 0..a.tensor.l() {
+        //             let rootgrad = root.grad.get( &[k, i]);
+		// 			let t1 = a.grad.get( &[i, j]) + (x.tensor.get( &[k, j]) * rootgrad);
+		// 			let t2 = x.grad.get( &[k, j]) + (a.tensor.get( &[i, j]) * rootgrad);
+		// 			a.grad.set( &[i, j], t1);
+		// 			x.grad.set( &[k, j], t2);
+        //         }
+        //     }
+		// }
 
         let mut va: Vec<f64> = Vec::new();
         for i in 0..a.tensor.l2() {
