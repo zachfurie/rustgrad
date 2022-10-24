@@ -90,7 +90,8 @@ impl Tensor {
                 incs[i] = temp 
             }
         }
-        let std = (shaper[shaper.len()-1] as f64).sqrt();
+        // let std = (shaper[shaper.len()-1] as f64).sqrt(); // This will not be correct for cases like conv2d
+        let std = ((shaper[0]*shaper[1]) as f64).sqrt(); // for conv2d, but will not work on batched linear
         let mut rng = rand::thread_rng();
         let mut t = Tensor {
             data:   vec![1.; data_len], // all tensor data in a single slice 
@@ -123,7 +124,8 @@ impl Tensor {
                 incs[i] = temp 
             }
         }
-        let std = (2. / (shaper[shaper.len()-1] as f64)).sqrt();
+        // let std = (2. / (shaper[shaper.len()-1] as f64)).sqrt(); // This will not be correct for cases like conv2d
+        let std = (2. / ((shaper[0]*shaper[1]) as f64)).sqrt(); // for conv2d, but will not work on batched linear
         let mut rng = rand::thread_rng();
         let mut t = Tensor {
             data:   vec![1.; data_len], // all tensor data in a single slice 
@@ -204,8 +206,17 @@ impl Tensor {
 }
 
 fn _add_same_size(dst: &mut Tensor, t: &Tensor ) {
-    for (i,_) in t.data.iter().enumerate() {
-        dst.data[i] += t.data[i]
+    for (i,x) in t.data.iter().enumerate() {
+        dst.data[i] += x
+    }
+}
+
+fn _add_same_size_fast(a: &Tensor, b: &Tensor ) -> Tensor {
+    let f: Vec<f64> = a.data.iter().zip(b.data.iter()).map(|(&aa, &bb)| aa + bb).collect();
+    Tensor {
+        data: f,
+        shape: a.shape.to_vec(),
+        diminc: a.diminc.to_vec(),
     }
 }
 
@@ -226,8 +237,8 @@ fn leaf(tens: Tensor, require_grad: bool) -> Box<Node> {
 
 // Syntactic sugar for leaf nodes that are weights
 fn weight(shaper: Vec<usize>) -> Box<Node> {
-	let tens = Tensor::xavier(&shaper);
-    // let tens = Tensor::he(&shaper);
+	// let tens = Tensor::xavier(&shaper);
+    let tens = Tensor::he(&shaper);
     let zero_grad = Tensor::ones(&shaper);
 	Box::new(Node {
         left: None,
@@ -270,13 +281,28 @@ fn matmul(a: Box<Node>, x: Box<Node>) -> Box<Node> {
 fn reshape_node(inn: Box<Node>, shaper: Vec<usize>) -> Box<Node> {
 	let zero_grad = Tensor::ones(&shaper);
 	let data = Tensor::zeros(&shaper);
+    let rq = inn.require_grad;
 	Box::new(Node {
         left: Some(inn), 
         right: None, 
         op: "reshape", 
         tensor: data, 
         grad: zero_grad, 
-        require_grad: true,
+        require_grad: rq,
+    })
+}
+
+fn _batch_norm(a: Box<Node>)-> Box<Node> {
+    let zero_grad = Tensor::ones(&a.grad.shape);
+	let data = Tensor::zeros(&a.tensor.shape);
+    let rq = a.require_grad;
+	Box::new(Node{
+        left: Some(a), 
+        right: None, 
+        op: "bn",
+        tensor: data, 
+        grad: zero_grad, 
+        require_grad: rq,
     })
 }
 
@@ -348,14 +374,17 @@ fn conv2d(a: Box<Node>, conv_size: Vec<usize>, filters: usize) -> Box<Node> {
     let x = weight(vec![conv_size[0], conv_size[1], filters]);
 	let zero_grad = Tensor::ones(&vec![1 + a.tensor.l2() - x.tensor.shape[0], 1 + a.tensor.l() - x.tensor.l2(), filters]);
 	let data = Tensor::zeros(&vec![1 + a.tensor.l2() - x.tensor.shape[0], 1 + a.tensor.l() - x.tensor.l2(), filters]);
-	Box::new(Node{
+    let bias = weight(data.shape.to_vec());
+	let cv_layer = Box::new(Node{
         left: Some(a), 
         right: Some(x), 
         op: "c2d",
         tensor: data, 
         grad: zero_grad, 
         require_grad: true,
-    })
+    });
+    let plus_bias = add(cv_layer, bias);
+	plus_bias
 }
 
 // ReLU
@@ -374,8 +403,8 @@ fn relu(a: Box<Node>) -> Box<Node> {
 
 // Max Pooling 2D
 fn max_pool(inn: Box<Node>, shaper: Vec<usize>) -> Box<Node> {
-	let zero_grad = Tensor::ones(&shaper);
-	let data = Tensor::zeros(&shaper);
+	let zero_grad = Tensor::ones(&vec![1 + inn.tensor.shape[0] - shaper[0], 1 + inn.tensor.l2() - shaper[1], inn.tensor.l()]);
+	let data = Tensor::zeros(&vec![1 + inn.tensor.shape[0] - shaper[0], 1 + inn.tensor.l2() - shaper[1], inn.tensor.l()]);
 	Box::new(Node {
         left: Some(inn), 
         right: None, 
@@ -384,6 +413,13 @@ fn max_pool(inn: Box<Node>, shaper: Vec<usize>) -> Box<Node> {
         grad: zero_grad, 
         require_grad: true,
     })
+}
+
+// take 3 dimensional input, flatten to 1 dimensional vecotr (actually 2d with 0-dimension of length 1)
+fn flatten(inn: Box<Node>) -> Box<Node> {
+    let shaper = &inn.tensor.shape;
+    let bigshape = shaper[0] * shaper[1] * shaper[2];
+    reshape_node(inn, vec![1, bigshape])
 }
 
 //  ----------------------------------- LOSS AND OPTIM:  -----------------------------------
@@ -598,8 +634,9 @@ fn init_batch_grads(grads: &mut Vec<Tensor>, w: &Node) {
 }
 fn add_batch_grads(grads: &mut Vec<Tensor>, w: &Node, mut k: usize) -> usize{
     if w.op == "param" {
-        _add_same_size(&mut grads[k], &w.grad);
-       k += 1;
+        // _add_same_size(&mut grads[k], &w.grad);
+        grads[k] = _add_same_size_fast(&grads[k], &w.grad);
+        k += 1;
    }
    match &w.left {
        Some(x) => {
@@ -666,13 +703,12 @@ fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
 	}
 	if root.op == "+" { // add
 		// Return tensor a + b
-        let left = forward(root.left.unwrap(), &f_data);
-		let right = forward(root.right.unwrap(), &f_data);
-		for i in 0..root.tensor.shape[root.tensor.shape.len()-2] {
-			for j in 0..root.tensor.shape[root.tensor.shape.len()-1] {
-				root.tensor.set( &[i, j], left.tensor.get( &[i, j]) + right.tensor.get( &[i, j]));
-			};
-		};
+        let a1 = root.left.unwrap();
+		let x1 = root.right.unwrap();
+        let (left,right) = rayon::join(|| forward(a1, f_data), || forward(x1, f_data));
+
+        root.tensor = _add_same_size_fast(&right.tensor, &left.tensor);
+
         root.left = Some(left);
         root.right = Some(right);
 	} else if root.op == "mm" { // matmul
@@ -755,19 +791,34 @@ fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
         root.right = Some(drop_node);
     } else if root.op == "relu" {
         let a = forward(root.left.unwrap(), f_data);
-		for i in 0..a.tensor.l2() {
-			for j in 0..a.tensor.l() {
-                if root.tensor.get( &[i, j]) < 0.0 {
-                    root.tensor.set( &[i, j], 0.0);
-                } else {
-                    root.tensor.set( &[i, j], a.tensor.get(&[i,j]));
+        if a.tensor.shape.len() == 3 {
+            for k in 0..a.tensor.shape[0] {
+                for i in 0..a.tensor.l2() {
+                    for j in 0..a.tensor.l() {
+                        if root.tensor.get( &[k,i,j]) < 0.0 {
+                            root.tensor.set( &[k,i,j], 0.0);
+                        } else {
+                            root.tensor.set( &[k,i,j], a.tensor.get(&[k,i,j]));
+                        }
+                    }
                 }
-			}
-		}
+            }
+        } else {
+            for i in 0..a.tensor.l2() {
+                for j in 0..a.tensor.l() {
+                    if root.tensor.get( &[i, j]) < 0.0 {
+                        root.tensor.set( &[i, j], 0.0);
+                    } else {
+                        root.tensor.set( &[i, j], a.tensor.get(&[i,j]));
+                    }
+                }
+            }
+        }
         root.left = Some(a);
     } else if root.op == "c2d" {
-        let a = forward(root.left.unwrap(), f_data);
-        let x = forward(root.right.unwrap(), f_data);
+        let a1 = root.left.unwrap();
+		let x1 = root.right.unwrap();
+        let (a,x) = rayon::join(|| forward(a1, f_data), || forward(x1, f_data));
         let mut data = root.tensor;
         // println!("a {:?}", a.tensor.shape);
         // println!("x {:?}", x.tensor.shape);
@@ -796,15 +847,15 @@ fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
         root.left = Some(a);
     } else if root.op == "mp" {
         let a = forward(root.left.unwrap(), f_data);
-        let mut data = root.tensor;
-        let l2dif = a.tensor.shape[0] - data.l2();
-        let ldif = a.tensor.l2() - data.l();
-        for l in 0..data.l2() {
-            for k in 0..data.l() {
-                for m in 0..a.tensor.l() {
+        let data = &mut root.tensor;
+        let l2dif = a.tensor.shape[0] - data.shape[0];
+        let ldif = a.tensor.l2() - data.l2();
+        for m in 0..a.tensor.l() { // filter layer, left intact
+            for l in 0..data.shape[0] { // dimension 0 of output
+                for k in 0..data.l2() { // dimension 1 of output
                     let mut max = 0.0;
-                    for i in 0..(1 + l2dif) {
-                        for j in 0..(1+ ldif) {
+                    for i in 0..(1+l2dif) { // dimension 0 of maxpool kernel
+                        for j in 0..(1+ldif) { // dimension 1 of maxpool kernel
                             // println!("a: [{},{}], root: [{},{}]", i+ l,j+ k, l, k);
                             let temp = a.tensor.get(&[i + l, j+ k, m]);
                             if temp > max {
@@ -817,7 +868,6 @@ fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
             }
         }
         root.left = Some(a);
-        root.tensor = data;
     }
     // println!("op {} end", root.op);
     root
@@ -893,70 +943,6 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
             ).collect()); 
         }
         x.grad.data = vx;
-
-
-
-
-
-
-
-
-
-
-
-        // let mut va: Vec<_> = Vec::new();
-        // let mut vx: Vec<_> = Vec::new();
-        // for j in 0..a.tensor.l() {
-        //     (0..a.tensor.l2()).into_par_iter().map( |i| {
-        //         let mut t = a.grad.get( &[i, j]);
-        //         for i2 in 0..x.tensor.l2() {
-        //             t +=  x.tensor.get( &[i2, j]) * root.grad.get( &[i2, i]);
-        //         }
-        //         t
-        //     }).collect_into_vec(&mut va);
-        //     for e in 0..va.len() {
-        //         a.grad.set( &[e,j], va[e]);
-        //     };
-        //     (0..x.tensor.l2()).into_par_iter().map( |i2| {
-        //         let mut t = x.grad.get( &[i2, j]);
-        //         for i in 0..a.tensor.l2() {
-        //             t += a.tensor.get( &[i, j]) * root.grad.get( &[i2, i]);
-        //         }
-        //         t
-        //     }
-        //     ).collect_into_vec(&mut vx);
-        //     for e in 0..vx.len() {
-        //         x.grad.set( &[e, j], vx[e]);
-        //     };
-        // };
-
-        // let mut va: Vec<_> = Vec::new();
-        // let mut vx: Vec<_> = Vec::new();
-        // for i in 0..a.tensor.l2() {
-        //     (0..a.tensor.l()).into_par_iter().map( |j| {
-        //         let mut t = a.grad.get( &[i, j]);
-        //         for i2 in 0..x.tensor.l2() {
-        //             t +=  x.tensor.get( &[i2, j]) * root.grad.get( &[i2, i]);
-        //         }
-        //         t
-        //     }).collect_into_vec(&mut va);
-        //     for e in 0..va.len() {
-        //         a.grad.set( &[i, e], va[e]);
-        //     };
-        // }
-        // for i2 in 0..x.tensor.l2() {
-        //     (0..x.tensor.l()).into_par_iter().map( |j| {
-        //         let mut t = x.grad.get( &[i2, j]);
-        //         for i in 0..a.tensor.l2() {
-        //             t += a.tensor.get( &[i, j]) * root.grad.get( &[i2, i]);
-        //         }
-        //         t
-        //     }
-        //     ).collect_into_vec(&mut vx);
-        //     for e in 0..vx.len() {
-        //         x.grad.set( &[i2, e], vx[e]);
-        //     };
-        // };
         
         let (a1,x1) = rayon::join(|| backward(a), || backward(x));
         root.left = Some(a1);
@@ -979,13 +965,25 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
         root.left = Some(backward(a));
 	} else if root.op == "do" || root.op == "relu" {
         let mut a = root.left.unwrap();
-		for i in 0..a.tensor.l2() {
-			for j in 0..a.tensor.l() {
-                if root.tensor.get(&[i,j]) > 0.0 {
-                    a.grad.set(&[i, j], root.grad.get(&[i,j]));
-                } 
-			}
-		}
+        if a.tensor.shape.len() == 3 {
+            for k in 0..a.tensor.shape[0] {
+                for i in 0..a.tensor.l2() {
+                    for j in 0..a.tensor.l() {
+                        if root.tensor.get(&[k,i,j]) > 0.0 {
+                            a.grad.set(&[k,i,j], root.grad.get(&[k,i,j]));
+                        } 
+                    }
+                }
+            }
+        } else {
+            for i in 0..a.tensor.l2() {
+                for j in 0..a.tensor.l() {
+                    if root.tensor.get(&[i,j]) > 0.0 {
+                        a.grad.set(&[i, j], root.grad.get(&[i,j]));
+                    } 
+                }
+            }
+        }
         
         root.left = Some(backward(a));
     } else if root.op == "c2d" {
@@ -1006,8 +1004,9 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
                 }
             }
         }
-        root.left = Some(backward(a));
-        root.right = Some(backward(x));
+        let (a1,x1) = rayon::join(|| backward(a), || backward(x));
+        root.left = Some(a1);
+        root.right = Some(x1);
     } else if root.op == "reshape" {
         let mut a = root.left.unwrap();
         root.grad.reshape(&a.grad.shape);
@@ -1016,25 +1015,26 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
         root.left = Some(a);
     } else if root.op == "mp" {
         let mut a = root.left.unwrap();
-        let l2dif = a.tensor.shape[0] - root.tensor.l2();
-        let ldif = a.tensor.l2() - root.tensor.l();
-        for l in 0..root.tensor.l2() {
-            for k in 0..root.tensor.l() {
-                let mut max = 0.0;
-                let mut maxind = [0,0,0];
-                for m in 0..a.tensor.l2() {
+        let data = &root.tensor;
+        let l2dif = a.tensor.shape[0] - data.shape[0];
+        let ldif = a.tensor.l2() - data.l2();
+        for m in 0..a.tensor.l() {
+            for l in 0..data.shape[0] {
+                for k in 0..data.l2() {
+                    let mut max = 0.0;
+                    let mut maxind = [0,0,0];
                     for i in 0..(1 + l2dif) {
                         for j in 0..(1+ ldif) {
                             // println!("a: [{},{}], root: [{},{}]", i+ l,j+ k, l, k);
-                            let temp = a.tensor.get(&[ i + l, j+ k, m]);
+                            let temp = a.tensor.get(&[i + l, j+ k, m]);
                             if temp > max {
                                 max = temp;
                                 maxind = [i + l, j+ k, m];
                             }
                         }
                     }
+                    a.grad.set(&maxind, root.grad.get(&[l,k]));
                 }
-                a.grad.set(&maxind, root.grad.get(&[l,k]));
             }
         }
         root.left = Some(backward(a));
@@ -1050,31 +1050,34 @@ fn _simple(dim0: usize, dim1: usize) -> Box<Node> {
     let x_placeholder = Tensor::zeros(&vec![dim0, dim1]);
 	let mut x_node = leaf(x_placeholder, false);
     x_node.op = "input";
-    let l1 = linear(x_node, 100);
+
+    // let l1 = linear(x_node, 100);
+    // let s1 = sigmoid(l1);
+    // let d1 = dropout(s1, 0.1);
+    // let l2 = linear(d1, 10);
+    // log_softmax(l2)
+
+    let r1 = reshape_node(x_node, vec![28,28]);
+    let c1 = conv2d(r1, vec![5,5], 3);
+    let r1 = relu(c1);
+    let m1 = max_pool(r1, vec![2,2]);
+    let r2 = flatten(m1);
+    let l1 = linear(r2, 128);
     let s1 = sigmoid(l1);
-    let d1 = dropout(s1, 0.1);
-    let l2 = linear(d1, 10);
-
-    // let r1 = reshape_node(x_node, vec![28,28]);
-    // let c1 = conv2d(r1, vec![5,5], 10);
-    // let m1 = max_pool(c1, vec![12,12,10]);
-    // let r2 = reshape_node(m1, vec![1,1440]);
-
-    // let s1 = sigmoid(r2);
-    // let l2 = linear(s1, 10);
-
+    let l2 = linear(s1, 10);
     log_softmax(l2)
 }
 
 pub(crate) fn simple() -> std::io::Result<()> {
-    let dataset_size = 51200; // default: 51200
+    let dataset_size = 1; // default: 51200
     let lr = 0.001; // default: 0.001
-    let epochs = 10;
+    let epochs = 100;
 
     // Two different implementations of minibatching.
     // If using one, the other should = 1.
+    // batch_size is SAFER but SLOWER than bsz!!! (safer because 2d layers like conv2d and max pool are not set up to handle batched inputs)
     let batch_size = 1; // each element in training set is a single input, batching is done via batch() function.
-    let bsz = 32; // each element in training set is a batch of inputs.
+    let bsz = 1; // each element in training set is a batch of inputs.
 
 // ========== read in data =============================
     let file = File::open("mnist_train.csv")?;
@@ -1188,24 +1191,24 @@ pub(crate) fn simple() -> std::io::Result<()> {
         let mins = elapsed_time / 60;
         let mut total_loss = 0.0;
 
-        // for t in 0..x_train.len() {
-        //     let x = &x_train[t]; 
-        //     let y = &y_train[t]; 
-        //     out = forward(out, &x);
-        //     let loss = nll_loss(&mut out, y);
-        //     total_loss += loss;
-        // }
-        // println!("Epoch {} | {} | {} minutes {} seconds", epoch, total_loss / (x_train.len() as f64), mins, extra_seconds);
-        
-
-        for t in 0..x_test.len() {
-            let x = &x_test[t]; 
-            let y = &y_test[t]; 
+        for t in 0..x_train.len() {
+            let x = &x_train[t]; 
+            let y = &y_train[t]; 
             out = forward(out, &x);
             let loss = nll_loss(&mut out, y);
             total_loss += loss;
         }
-        println!("Epoch {} | {} | {} minutes {} seconds", epoch, total_loss / (x_test.len() as f64), mins, extra_seconds);
+        println!("Epoch {} | {} | {} minutes {} seconds", epoch, total_loss / (x_train.len() as f64), mins, extra_seconds);
+        
+
+        // for t in 0..x_test.len() {
+        //     let x = &x_test[t]; 
+        //     let y = &y_test[t]; 
+        //     out = forward(out, &x);
+        //     let loss = nll_loss(&mut out, y);
+        //     total_loss += loss;
+        // }
+        // println!("Epoch {} | {} | {} minutes {} seconds", epoch, total_loss / (x_test.len() as f64), mins, extra_seconds);
         if total_loss < best_epoch_loss {
             best_epoch_loss = total_loss;
             best_epoch = epoch;
