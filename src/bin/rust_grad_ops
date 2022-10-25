@@ -376,11 +376,11 @@ fn conv2d(a: Box<Node>, conv_size: Vec<usize>, filters: usize) -> Box<Node> {
     let x = weight(vec![conv_size[0], conv_size[1], filters]);
     let mut zero_grad = Tensor::ones(&vec![1 + a.tensor.l2() - x.tensor.shape[0], 1 + a.tensor.l() - x.tensor.shape[1], filters]);
 	let mut data = Tensor::zeros(&vec![1 + a.tensor.l2() - x.tensor.shape[0], 1 + a.tensor.l() - x.tensor.shape[1], filters]);
-    if a.tensor.shape.len() == 3 {
-        zero_grad = Tensor::ones(&vec![a.tensor.shape[0], 1 + a.tensor.l2() - x.tensor.shape[0], 1 + a.tensor.l() - x.tensor.shape[1], filters]);
-	    data = Tensor::zeros(&vec![a.tensor.shape[0], 1 + a.tensor.l2() - x.tensor.shape[0], 1 + a.tensor.l() - x.tensor.shape[1], filters]);
-    } 
-	// let bias = weight(data.shape.to_vec());
+    // if a.tensor.shape.len() == 3 {
+    //     zero_grad = Tensor::ones(&vec![a.tensor.shape[0], 1 + a.tensor.l2() - x.tensor.shape[0], 1 + a.tensor.l() - x.tensor.shape[1], filters]);
+	//     data = Tensor::zeros(&vec![a.tensor.shape[0], 1 + a.tensor.l2() - x.tensor.shape[0], 1 + a.tensor.l() - x.tensor.shape[1], filters]);
+    // } 
+	let bias = weight(data.shape.to_vec());
 	let cv_layer = Box::new(Node{
         left: Some(a), 
         right: Some(x), 
@@ -389,9 +389,8 @@ fn conv2d(a: Box<Node>, conv_size: Vec<usize>, filters: usize) -> Box<Node> {
         grad: zero_grad, 
         require_grad: true,
     });
-    // let plus_bias = add(cv_layer, bias);
-	// plus_bias
-    cv_layer
+    let plus_bias = add(cv_layer, bias);
+	plus_bias
 }
 
 // ReLU
@@ -822,7 +821,7 @@ fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
 		// 	}
 		// }
         for i in 0..a.tensor.data.len() {
-            let flip = rng.gen_bool(drop_node.tensor.get(&[0]));
+            let flip = rng.gen_bool(drop_node.tensor.get(&[0]) as f64);
             if flip == true {
                 root.tensor.data[i] = 0.0;
             } else {
@@ -833,36 +832,36 @@ fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
         root.right = Some(drop_node);
     } else if root.op == "relu" {
         let mut a = forward(root.left.unwrap(), f_data);
-        // if a.tensor.shape.len() == 3 {
-        //     for k in 0..a.tensor.shape[0] {
-        //         for i in 0..a.tensor.l2() {
-        //             for j in 0..a.tensor.l() {
-        //                 if root.tensor.get( &[k,i,j]) < 0.0 {
-        //                     root.tensor.set( &[k,i,j], 0.0);
-        //                 } else {
-        //                     root.tensor.set( &[k,i,j], a.tensor.get(&[k,i,j]));
-        //                 }
-        //             }
-        //         }
-        //     }
-        // } else {
-        //     for i in 0..a.tensor.l2() {
-        //         for j in 0..a.tensor.l() {
-        //             if root.tensor.get( &[i, j]) < 0.0 {
-        //                 root.tensor.set( &[i, j], 0.0);
-        //             } else {
-        //                 root.tensor.set( &[i, j], a.tensor.get(&[i,j]));
-        //             }
-        //         }
-        //     }
-        // }
-        let relued: Vec<f64> = a.tensor.data.iter().map(|e| {
-            if e < &0.0 {
-                0.0
-            } else {
-                e.clone()
-            }}).collect();
-        a.tensor.data = relued;
+        if a.tensor.shape.len() == 3 {
+            for k in 0..a.tensor.shape[0] {
+                for i in 0..a.tensor.l2() {
+                    for j in 0..a.tensor.l() {
+                        if root.tensor.get( &[k,i,j]) < 0.0 {
+                            root.tensor.set( &[k,i,j], 0.0);
+                        } else {
+                            root.tensor.set( &[k,i,j], a.tensor.get(&[k,i,j]));
+                        }
+                    }
+                }
+            }
+        } else {
+            for i in 0..a.tensor.l2() {
+                for j in 0..a.tensor.l() {
+                    if root.tensor.get( &[i, j]) < 0.0 {
+                        root.tensor.set( &[i, j], 0.0);
+                    } else {
+                        root.tensor.set( &[i, j], a.tensor.get(&[i,j]));
+                    }
+                }
+            }
+        }
+        // let relued: Vec<f64> = a.tensor.data.iter().map(|e| {
+        //     if e < &0.0 {
+        //         0.0
+        //     } else {
+        //         e.clone()
+        //     }}).collect();
+        // a.tensor.data = relued;
         root.left = Some(a);
     } else if root.op == "c2d" {
         let a1 = root.left.unwrap();
@@ -955,6 +954,7 @@ fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
 }
 
 fn backward(mut root: Box<Node>) -> Box<Node>{
+    // println!("back {}", root.op);
 	if !root.require_grad {
 		return root;
 	} 
@@ -1130,8 +1130,8 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
         let mm = x.tensor.shape[2];
         let jj = x.tensor.shape[1];
         let ii = x.tensor.shape[0];
-        let aj = a.tensor.shape[1];
-        let ai = a.tensor.shape[0];
+        let aj = a.tensor.l();
+        let ai = a.tensor.l2();
         let ll = root.tensor.shape[0];
         let kk = root.tensor.shape[1];
         if a.tensor.shape.len() == 3 {
@@ -1259,16 +1259,16 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
                                 a.tensor._get_ind(&[i,j])..
                                 a.tensor._get_ind(&[ai-ii,aj-jj])
                                 ].iter().step_by(jj),
-                                &mut root.grad.data[m..].iter().step_by(mm),
+                            &mut root.grad.data[m..].iter().step_by(mm),
                         ).map(|(a,r)| {a * r}).sum()
                     }).collect()); 
                 }
             }
         }
 
-
-
-        a.grad.data = va;
+        if a.require_grad {
+            a.grad.data = va;
+        }
         x.grad.data = vx;
         
         let (a1,x1) = rayon::join(|| backward(a), || backward(x));
@@ -1326,19 +1326,20 @@ fn _simple(dim0: usize, dim1: usize) -> Box<Node> {
     // let l2 = linear(d1, 10);
     // log_softmax(l2)
 
-    let r1 = reshape_node(x_node, vec![dim0,28,28]);
+    let r1 = reshape_node(x_node, vec![28,28]);
     let c1 = conv2d(r1, vec![5,5], 10);
     let re1 = relu(c1);
     let m1 = max_pool(re1, vec![2,2]);
     let r2 = flatten(m1);
     let d1 = dropout(r2, 0.1);
-    // let l1 = linear(d1, 128);
-    // let s1 = sigmoid(l1);
+    // // let l1 = linear(d1, 128);
+    // // let s1 = sigmoid(l1);
     let l2 = linear(d1, 10);
-
-    // let c1 = conv2d(x_node, vec![1,784], 10);
-    // let l2 = flatten(c1);
     log_softmax(l2)
+
+    // let l1 = conv2d(x_node, vec![dim0,dim1], 10);
+    // let l2 = flatten(l1);
+    // log_softmax(l2)
 }
 
 pub(crate) fn simple() -> std::io::Result<()> {
@@ -1349,7 +1350,7 @@ pub(crate) fn simple() -> std::io::Result<()> {
     // Two different implementations of minibatching.
     // If using one, the other should = 1.
     // batch_size is SAFER but SLOWER than bsz!!! (safer because 2d layers like conv2d and max pool are not set up to handle batched inputs)
-    let batch_size = 1; // each element in training set is a single input, batching is done via batch() function.
+    let batch_size = 64; // each element in training set is a single input, batching is done via batch() function.
     let bsz = 1; // each element in training set is a batch of inputs.
 
 // ========== read in data =============================
@@ -1504,11 +1505,10 @@ pub(crate) fn simple() -> std::io::Result<()> {
     let mut incorrect = 0;
     let mut total_loss = 0.0;
     for t in 0..x_val.len() {
-        let x = &x_val[t]; //.copy_tens();
-        let y = &y_val[t]; //.copy_tens();
+        let x = &x_val[t]; 
+        let y = &y_val[t]; 
         out = forward(out, &x);
 
-        
         for q in 0..out.tensor.l2() {
             let mut max_pred = 0.0;
             let mut max_ind = 0;
