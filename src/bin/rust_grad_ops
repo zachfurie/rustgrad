@@ -5,6 +5,8 @@ use rand::prelude::*;
 use csv;
 use rand_distr;
 use rayon::prelude::*;
+use chrono::prelude::*;
+
 
 // ----------------------------------- Notes:  ----------------------------------------------
 
@@ -12,6 +14,8 @@ use rayon::prelude::*;
 // implement parallelism
 // Maybe use mutable arrays instead of vecs
 // dont think i need separate tensor structs for data and gradients since they will always be the same shape.
+
+// max pooling is probably wring. right now it has stride of 1, but i think its never supposed to overlap
 
 //  ----------------------------------- Data Structures:  -----------------------------------
 
@@ -146,6 +150,20 @@ impl Tensor {
         for (i,x) in ind.iter().enumerate() {
             index += self.diminc[i] * x;
         };
+        self.data[index]
+    }
+
+    fn _safe_get(&self, ind: &[usize], info: &str) -> f64 {
+        let mut index = 0;
+        if ind.len() > self.diminc.len() {
+            panic!("ERROR: index {:?} is invalid for tensor with shape {:?}. \n Info: {:?}", ind, self.shape, info);
+        } 
+        for (i,x) in ind.iter().enumerate() {
+            index += self.diminc[i] * x;
+        };
+        if index >= self.data.len() {
+            panic!("ERROR: index {:?} is outside of tensor with shape {:?}. \n Info: {:?}", ind, self.shape, info);
+        } 
         self.data[index]
     }
 
@@ -371,17 +389,14 @@ fn dropout(inn: Box<Node>, drop_prob: f64) -> Box<Node> {
     })
 }
 
-// Conv2D
+// Conv2D - NOTE: conv2d currently works for 2d input OR 3d input where last dimension is channels/filters. DOES NOT WORK with batched inputs!
 fn conv2d(a: Box<Node>, conv_size: Vec<usize>, filters: usize) -> Box<Node> {
     let x = weight(vec![conv_size[0], conv_size[1], filters]);
-    let mut zero_grad = Tensor::ones(&vec![1 + a.tensor.l2() - x.tensor.shape[0], 1 + a.tensor.l() - x.tensor.shape[1], filters]);
-	let mut data = Tensor::zeros(&vec![1 + a.tensor.l2() - x.tensor.shape[0], 1 + a.tensor.l() - x.tensor.shape[1], filters]);
-    // if a.tensor.shape.len() == 3 {
-    //     zero_grad = Tensor::ones(&vec![a.tensor.shape[0], 1 + a.tensor.l2() - x.tensor.shape[0], 1 + a.tensor.l() - x.tensor.shape[1], filters]);
-	//     data = Tensor::zeros(&vec![a.tensor.shape[0], 1 + a.tensor.l2() - x.tensor.shape[0], 1 + a.tensor.l() - x.tensor.shape[1], filters]);
-    // } 
-	let bias = weight(data.shape.to_vec());
-	let cv_layer = Box::new(Node{
+    let zero_grad = Tensor::ones(&vec![1 + a.tensor.shape[0] - x.tensor.shape[0], 1 + a.tensor.shape[1] - x.tensor.shape[1], filters]);
+	let data = Tensor::zeros(&vec![1 + a.tensor.shape[0] - x.tensor.shape[0], 1 + a.tensor.shape[1] - x.tensor.shape[1], filters]);
+	let ll = a.tensor.shape.to_vec();
+    let dl = data.shape.to_vec();
+    let mut cv_layer = Box::new(Node{
         left: Some(a), 
         right: Some(x), 
         op: "c2d",
@@ -389,8 +404,31 @@ fn conv2d(a: Box<Node>, conv_size: Vec<usize>, filters: usize) -> Box<Node> {
         grad: zero_grad, 
         require_grad: true,
     });
+    if ll.len() == 3 {
+        let a = cv_layer.left.unwrap();
+        let sd = _sum_dim(a);
+        cv_layer.left = Some(sd);
+    } 
+    // println!("cv: {:?}", cv_layer.grad.shape);
+    let bias = weight(dl);
     let plus_bias = add(cv_layer, bias);
 	plus_bias
+}
+
+// Helper for conv2d
+fn _sum_dim(a: Box<Node>) -> Box<Node> {
+    let new_shape = vec![a.tensor.shape[0], a.tensor.shape[1]];
+	let zero_grad = Tensor::ones(&new_shape);
+	let data = Tensor::zeros(&new_shape);
+    let rq = a.require_grad;
+	Box::new(Node{
+        left: Some(a), 
+        right: None, 
+        op: "sum_dim",
+        tensor: data, 
+        grad: zero_grad, 
+        require_grad: rq,
+    })
 }
 
 // ReLU
@@ -409,9 +447,9 @@ fn relu(a: Box<Node>) -> Box<Node> {
 
 // Max Pooling 2D
 fn max_pool(inn: Box<Node>, shaper: Vec<usize>) -> Box<Node> {
-	let zero_grad = Tensor::ones(&vec![1 + inn.tensor.shape[0] - shaper[0], 1 + inn.tensor.l2() - shaper[1], inn.tensor.l()]);
-	let data = Tensor::zeros(&vec![1 + inn.tensor.shape[0] - shaper[0], 1 + inn.tensor.l2() - shaper[1], inn.tensor.l()]);
-	Box::new(Node {
+	let zero_grad = Tensor::ones(&vec![inn.tensor.shape[0] / shaper[0], inn.tensor.l2() / shaper[1], inn.tensor.l()]);
+	let data = Tensor::zeros(&vec![inn.tensor.shape[0] / shaper[0], inn.tensor.l2() / shaper[1], inn.tensor.l()]);
+    Box::new(Node {
         left: Some(inn), 
         right: None, 
         op: "mp", 
@@ -424,7 +462,7 @@ fn max_pool(inn: Box<Node>, shaper: Vec<usize>) -> Box<Node> {
 // take 3 dimensional input, flatten to 1 dimensional vector (actually 2d with 0-dimension of length 1)
 fn flatten(inn: Box<Node>) -> Box<Node> {
     let shaper = &inn.tensor.shape;
-    let bigshape = shaper[0] * shaper[1] * shaper[2];
+    let bigshape = shaper.iter().product();
     reshape_node(inn, vec![1, bigshape])
 }
 
@@ -721,6 +759,7 @@ fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
 	} else {
 		let zeroed_data = Tensor::zeros(&root.tensor.shape);
 		root.tensor = zeroed_data;
+        // println!("op: {} | shape {:?}", root.op, root.tensor.shape);
 	}
 	if root.op == "+" { // add
 		// Return tensor a + b
@@ -832,36 +871,36 @@ fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
         root.right = Some(drop_node);
     } else if root.op == "relu" {
         let mut a = forward(root.left.unwrap(), f_data);
-        if a.tensor.shape.len() == 3 {
-            for k in 0..a.tensor.shape[0] {
-                for i in 0..a.tensor.l2() {
-                    for j in 0..a.tensor.l() {
-                        if root.tensor.get( &[k,i,j]) < 0.0 {
-                            root.tensor.set( &[k,i,j], 0.0);
-                        } else {
-                            root.tensor.set( &[k,i,j], a.tensor.get(&[k,i,j]));
-                        }
-                    }
-                }
-            }
-        } else {
-            for i in 0..a.tensor.l2() {
-                for j in 0..a.tensor.l() {
-                    if root.tensor.get( &[i, j]) < 0.0 {
-                        root.tensor.set( &[i, j], 0.0);
-                    } else {
-                        root.tensor.set( &[i, j], a.tensor.get(&[i,j]));
-                    }
-                }
-            }
-        }
-        // let relued: Vec<f64> = a.tensor.data.iter().map(|e| {
-        //     if e < &0.0 {
-        //         0.0
-        //     } else {
-        //         e.clone()
-        //     }}).collect();
-        // a.tensor.data = relued;
+        // if a.tensor.shape.len() == 3 {
+        //     for k in 0..a.tensor.shape[0] {
+        //         for i in 0..a.tensor.l2() {
+        //             for j in 0..a.tensor.l() {
+        //                 if root.tensor.get( &[k,i,j]) < 0.0 {
+        //                     root.tensor.set( &[k,i,j], 0.0);
+        //                 } else {
+        //                     root.tensor.set( &[k,i,j], a.tensor.get(&[k,i,j]));
+        //                 }
+        //             }
+        //         }
+        //     }
+        // } else {
+        //     for i in 0..a.tensor.l2() {
+        //         for j in 0..a.tensor.l() {
+        //             if root.tensor.get( &[i, j]) < 0.0 {
+        //                 root.tensor.set( &[i, j], 0.0);
+        //             } else {
+        //                 root.tensor.set( &[i, j], a.tensor.get(&[i,j]));
+        //             }
+        //         }
+        //     }
+        // }
+        let relued: Vec<f64> = a.tensor.data.iter().map(|e| {
+            if e < &0.0 {
+                0.0
+            } else {
+                e.clone()
+            }}).collect();
+        a.tensor.data = relued;
         root.left = Some(a);
     } else if root.op == "c2d" {
         let a1 = root.left.unwrap();
@@ -926,18 +965,42 @@ fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
         root.tensor.reshape(&root.grad.shape);
         root.left = Some(a);
     } else if root.op == "mp" {
+        // let a = root.left.unwrap();
+        // println!("mp before forward | a shape: {:?} | a datalen: {:?}", a.tensor.shape, a.tensor.data.len());
+        // root.left = Some(a);
         let a = forward(root.left.unwrap(), f_data);
+
+        // println!("start of mp | a shape: {:?} | a datalen: {:?}", a.tensor.shape, a.tensor.data.len());
+
         let data = &mut root.tensor;
-        let l2dif = a.tensor.shape[0] - data.shape[0];
-        let ldif = a.tensor.l2() - data.l2();
+        // let l2dif = a.tensor.shape[0] - data.shape[0];
+        // let ldif = a.tensor.l2() - data.l2();
+        // for m in 0..a.tensor.l() { // filter layer, left intact
+        //     for l in 0..data.shape[0] { // dimension 0 of output
+        //         for k in 0..data.l2() { // dimension 1 of output
+        //             let mut max = 0.0;
+        //             for i in 0..(1+l2dif) { // dimension 0 of maxpool kernel
+        //                 for j in 0..(1+ldif) { // dimension 1 of maxpool kernel
+        //                     // println!("a: [{},{}], root: [{},{}]", i+ l,j+ k, l, k);
+        //                     let temp = a.tensor.get(&[i + l, j+ k, m]);
+        //                     if temp > max {
+        //                         max = temp;
+        //                     }
+        //                 }
+        //             }
+        //             data.set(&[l, k, m], max);
+        //         }
+        //     }
+        // }
+        let l2dif = a.tensor.shape[0] / data.shape[0];
+        let ldif = a.tensor.l2() / data.l2();
         for m in 0..a.tensor.l() { // filter layer, left intact
             for l in 0..data.shape[0] { // dimension 0 of output
                 for k in 0..data.l2() { // dimension 1 of output
                     let mut max = 0.0;
-                    for i in 0..(1+l2dif) { // dimension 0 of maxpool kernel
-                        for j in 0..(1+ldif) { // dimension 1 of maxpool kernel
-                            // println!("a: [{},{}], root: [{},{}]", i+ l,j+ k, l, k);
-                            let temp = a.tensor.get(&[i + l, j+ k, m]);
+                    for i in 0..(l2dif) { // dimension 0 of maxpool kernel
+                        for j in 0..(ldif) { // dimension 1 of maxpool kernel
+                            let temp = a.tensor._safe_get(&[i + l*l2dif, j+ k*ldif, m], "maxpool");
                             if temp > max {
                                 max = temp;
                             }
@@ -948,8 +1011,34 @@ fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
             }
         }
         root.left = Some(a);
+    } else if root.op == "sum_dim" {
+        let a = forward(root.left.unwrap(), f_data);
+        // let mm = a.tensor.shape[a.tensor.shape.len()-1];
+        // let mut m = 0;
+        // let mut summer = 0.0;
+        // for i in 0..a.tensor.data.len() {
+        //     summer += a.tensor.data[i];
+        //     m += 1;
+        //     if m+1 == mm {
+        //         root.tensor.data[i/(mm-1)] = summer;
+        //         m = 0;
+        //         summer = 0.0;
+        //     }
+        // }
+        for i in 0..a.tensor.shape[0] {
+            for j in 0..a.tensor.shape[1] {
+                let mut summer = 0.0;
+                for k in 0..a.tensor.shape[2] {
+                    summer += a.tensor.get(&[i,j,k]);
+                }
+                root.tensor.set(&[i,j], summer);
+            }
+        }
+        root.left = Some(a);
     }
     // println!("op {} end", root.op);
+    // println!("END op: {} | shape {:?}", root.op, root.tensor.shape);
+
     root
 }
 
@@ -1108,6 +1197,9 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
     } else if root.op == "c2d" {
         let mut a = root.left.unwrap();
         let mut x = root.right.unwrap();
+        // println!("r: {:?}", root.grad.shape);
+        // println!("x: {:?}", x.grad.shape);
+        // println!("a: {:?}", a.grad.shape);
         // let data = &root.tensor;
         // for m in 0..(x.tensor.l()) { // Filter Layer
         //     for l in 0..data.shape[0] {
@@ -1132,137 +1224,108 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
         let ii = x.tensor.shape[0];
         let aj = a.tensor.l();
         let ai = a.tensor.l2();
-        let ll = root.tensor.shape[0];
-        let kk = root.tensor.shape[1];
-        if a.tensor.shape.len() == 3 {
-            for batch in 0..a.tensor.shape[0] {
-                if a.require_grad {for a1 in 0..a.grad.l2() {
-                    va.extend::<Vec<f64>>((0..a.grad.l()).into_par_iter().map( |a2| {
-                        let mut t3:usize = 0;
-                        let mut t4:usize = 0;
-                        let mut t1:usize = ii-1;
-                        let mut t2:usize = jj-1;
-                        let mut t5:usize = 0;
-                        let mut t6:usize = 0;
-                        let mut t7:usize = a1 + (ii-1);
-                        let mut t8:usize = a2 + (jj-1);
-                        if a1+1 >= ll{
-                            t3 = 1+ a1 - ll;
-                        }
-                        if a2+1 >= kk {
-                            t4 = 1+a2-kk;
-                        }
-                        if ii >= a1+1{
-                            t1 = a1;
-                        }
-                        if jj >= a2+1 {
-                            t2 = a2;
-                        }
-                        if a2 + 1 > jj {
-                            t6 = a2 + 1 - jj;
-                        }
-                        if a1 + 1 > ii {
-                            t5 = a1 + 1 - ii;
-                        }
-                        if  t7 >= ll{
-                            t7 = ll - 1;
-                        }
-                        if t8 >= kk {
-                            t8 = kk - 1;
-                        }
-                        zip(&mut x.tensor.data[
-                            x.tensor._get_ind(&[t3,t4,0]).. // will almost always be zero since usize can only be positive
-                            x.tensor._get_ind(&[t1,t2,mm])
-                        ].iter().step_by(mm),
-                        &mut root.grad.data[
-                            root.grad._get_ind(&[t5,t6,0]).. // will almost always be zero since usize can only be positive
-                            root.grad._get_ind(&[t7,t8,mm])
-                        ].iter().step_by(mm)
-                        ).map(|(x,r)| {x * r}).sum()
-                    }).collect());   
-                }}    
-                for i in 0..x.tensor.shape[0] { // Kernel dim 0
-                    for j in 0..x.tensor.shape[1] { // Kernel dim 1
-                        vx.extend::<Vec<f64>>((0..mm).into_par_iter().map( |m| {
-                            zip(
-                                &mut a.tensor.data[
-                                    a.tensor._get_ind(&[batch,i,j])..
-                                    a.tensor._get_ind(&[batch,ai-ii,aj-jj])
-                                    ].iter().step_by(jj),
-                                &mut root.grad.data[root.grad._get_ind(&[batch,0,0,m])..root.grad._get_ind(&[batch+1,0,0,m])].iter().step_by(mm),
-                            ).map(|(a,r)| {a * r}).sum()
-                        }).collect()); 
-                    }
-                }
-            }
-        } else {
-            if a.require_grad {
-                for a1 in 0..a.grad.shape[0] {
-                    va.extend::<Vec<f64>>((0..a.grad.shape[1]).into_par_iter().map( |a2| {
-                        let mut t3:usize = 0;
-                        let mut t4:usize = 0;
-                        let mut t1:usize = ii-1;
-                        let mut t2:usize = jj-1;
-                        let mut t5:usize = 0;
-                        let mut t6:usize = 0;
-                        let mut t7:usize = a1 + (ii-1);
-                        let mut t8:usize = a2 + (jj-1);
-                        if a1+1 >= ll{
-                            t3 = 1+ a1 - ll;
-                        }
-                        if a2+1 >= kk {
-                            t4 = 1+a2-kk;
-                        }
-                        if ii >= a1+1{
-                            t1 = a1;
-                        }
-                        if jj >= a2+1 {
-                            t2 = a2;
-                        }
-                        if a2 + 1 > jj {
-                            t6 = a2 + 1 - jj;
-                        }
-                        if a1 + 1 > ii {
-                            t5 = a1 + 1 - ii;
-                        }
-                        if  t7 >= ll{
-                            t7 = ll - 1;
-                        }
-                        if t8 >= kk {
-                            t8 = kk - 1;
-                        }
-                        // zip(&mut x.tensor.data[
-                        //     x.tensor._get_ind(&[t3,t4,0]).. // will almost always be zero since usize can only be positive
-                        //     x.tensor._get_ind(&[t1,t2,mm])
-                        // ].iter().step_by(x.tensor.diminc.iter().sum()),
-                        // // ALERT ALERT ALERT
-                        // &mut root.grad.data[
-                        //     root.grad._get_ind(&[t5,t6,0]).. // will almost always be zero since usize can only be positive
-                        //     root.grad._get_ind(&[t7,t8,mm])
-                        // ].iter().step_by(mm)
-                        // ).map(|(x,r)| {x * r}).sum()
-                        let mut ret = 0.0;
-                        for qu in 0..(t1-t3) {
-                            for qa in 0..(t2-t4) {
-                                ret += x.tensor.get(&[t3 + qu, t4 + qa]) * root.grad.get(&[t5 + qu, t6 + qa]);
+        // let ll = root.tensor.shape[0];
+        // let kk = root.tensor.shape[1];
+        
+        if a.require_grad {
+            for a1 in 0..a.grad.shape[0] {
+                va.extend::<Vec<f64>>((0..a.grad.shape[1]).into_par_iter().map( |a2| {
+                    // let mut t3:usize = 0;
+                    // let mut t4:usize = 0;
+                    // let mut t1:usize = ii-1;
+                    // let mut t2:usize = jj-1;
+                    // let mut t5:usize = 0;
+                    // let mut t6:usize = 0;
+                    // let mut t7:usize = a1 + (ii-1);
+                    // let mut t8:usize = a2 + (jj-1);
+                    // if a1+1 >= ll{
+                    //     t3 = 1+ a1 - ll;
+                    // }
+                    // if a2+1 >= kk {
+                    //     t4 = 1+a2-kk;
+                    // }
+                    // if ii >= a1+1{
+                    //     t1 = a1;
+                    // }
+                    // if jj >= a2+1 {
+                    //     t2 = a2;
+                    // }
+                    // if a2 + 1 > jj {
+                    //     t6 = a2 + 1 - jj;
+                    // }
+                    // if a1 + 1 > ii {
+                    //     t5 = a1 + 1 - ii;
+                    // }
+                    // if  t7 >= ll{
+                    //     t7 = ll - 1;
+                    // }
+                    // if t8 >= kk {
+                    //     t8 = kk - 1;
+                    // }
+
+                    // zip(&mut x.tensor.data[
+                    //     x.tensor._get_ind(&[t3,t4,0]).. // will almost always be zero since usize can only be positive
+                    //     x.tensor._get_ind(&[t1,t2,mm])
+                    // ].iter().step_by(x.tensor.diminc.iter().sum()),
+                    // // ALERT ALERT ALERT
+                    // &mut root.grad.data[
+                    //     root.grad._get_ind(&[t5,t6,0]).. // will almost always be zero since usize can only be positive
+                    //     root.grad._get_ind(&[t7,t8,mm])
+                    // ].iter().step_by(mm)
+                    // ).map(|(x,r)| {x * r}).sum()
+
+                    // let mut p = false;
+                    // if t7 - t5 != t1 - t3 {
+                    //     p = true;
+                    //     println!("conv i not working {} {}", t7 - t5, t1 - t3 );
+                    // }
+                    // if t8 - t6 != t2 - t4 {
+                    //     p = true;
+                    //     println!("conv j not working {} {}", t8 - t6,  t2 - t4);
+                    // }
+                    // if p {
+                    //     panic!("");
+                    // }
+                    // let mut ret = 0.0;
+                    // for qu in 0..(t1-t3) {
+                    //     for qa in 0..(t2-t4) {
+                    //         ret += x.tensor.get(&[t3 + qu, t4 + qa]) * root.grad.get(&[t5 + qu, t6 + qa]);
+                    //     }
+                    // }
+                    // ret
+                    let mut temp:f64 = 0.0;
+                    for i in 0..ii {
+                        for j in 0..jj {
+                            if a1 >= i && a2 >= j && a1 + ii - (i+1) < ai && a2 + jj - (j+1) < aj {
+                                // println!("{} {} | {} {}", x.tensor._get_ind(&[i,j,0]), x.tensor._get_ind(&[i,j,mm]), root.grad._get_ind(&[a1 - i,a2 - j,0]),root.grad._get_ind(&[a1 - i,a2 - j,mm]));
+                                temp += zip(
+                                    &mut x.tensor.data[
+                                        x.tensor._get_ind(&[i,j,0]).. 
+                                        x.tensor._get_ind(&[i,j,mm])
+                                    ].iter(),
+                                    &mut root.grad.data[
+                                        root.grad._get_ind(&[a1 - i,a2 - j,0])..
+                                        root.grad._get_ind(&[a1 - i,a2 - j,mm])
+                                    ].iter()
+                                ).map(|(x,r)| {x * r}).sum::<f64>();
                             }
                         }
-                        ret
-                    }).collect());   
-                }
+                    }
+                    temp
+                }).collect());   
             }
-            for i in 0..x.tensor.shape[0] { // Kernel dim 0
-                for j in 0..x.tensor.shape[1] { // Kernel dim 1
-                    vx.extend::<Vec<f64>>((0..mm).into_par_iter().map( |m| {
-                        zip(
-                            &mut a.tensor.data[
-                                a.tensor._get_ind(&[i,j])..
-                                a.tensor._get_ind(&[ai-ii,aj-jj])
-                                ].iter().step_by(jj),
-                            &mut root.grad.data[m..].iter().step_by(mm),
-                        ).map(|(a,r)| {a * r}).sum()
-                    }).collect()); 
-                }
+        }
+        for i in 0..x.tensor.shape[0] { // Kernel dim 0
+            for j in 0..x.tensor.shape[1] { // Kernel dim 1
+                vx.extend::<Vec<f64>>((0..mm).into_par_iter().map( |m| {
+                    zip(
+                        &mut a.tensor.data[
+                            a.tensor._get_ind(&[i,j])..=
+                            a.tensor._get_ind(&[ai-ii+i,aj-jj+j])
+                            ].iter(), 
+                        &mut root.grad.data[m..].iter().step_by(mm),
+                    ).map(|(a,r)| {a * r}).sum()
+                }).collect()); 
             }
         }
 
@@ -1287,17 +1350,37 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
     } else if root.op == "mp" {
         let mut a = root.left.unwrap();
         let data = &root.tensor;
-        let l2dif = a.tensor.shape[0] - data.shape[0];
-        let ldif = a.tensor.l2() - data.l2();
-        for m in 0..a.tensor.l() {
-            for l in 0..data.shape[0] {
-                for k in 0..data.l2() {
+        // let l2dif = a.tensor.shape[0] - data.shape[0];
+        // let ldif = a.tensor.l2() - data.l2();
+        // for m in 0..a.tensor.l() {
+        //     for l in 0..data.shape[0] {
+        //         for k in 0..data.l2() {
+        //             let mut max = 0.0;
+        //             let mut maxind = [0,0,0];
+        //             for i in 0..(1 + l2dif) {
+        //                 for j in 0..(1+ ldif) {
+        //                     // println!("a: [{},{}], root: [{},{}]", i+ l,j+ k, l, k);
+        //                     let temp = a.tensor.get(&[i + l, j+ k, m]);
+        //                     if temp > max {
+        //                         max = temp;
+        //                         maxind = [i + l, j+ k, m];
+        //                     }
+        //                 }
+        //             }
+        //             a.grad.set(&maxind, root.grad.get(&[l,k]));
+        //         }
+        //     }
+        // }
+        let l2dif = a.tensor.shape[0] / data.shape[0];
+        let ldif = a.tensor.l2() / data.l2();
+        for m in 0..a.tensor.l() { // filter layer, left intact
+            for l in 0..data.shape[0] { // dimension 0 of output
+                for k in 0..data.l2() { // dimension 1 of output
                     let mut max = 0.0;
                     let mut maxind = [0,0,0];
-                    for i in 0..(1 + l2dif) {
-                        for j in 0..(1+ ldif) {
-                            // println!("a: [{},{}], root: [{},{}]", i+ l,j+ k, l, k);
-                            let temp = a.tensor.get(&[i + l, j+ k, m]);
+                    for i in 0..(l2dif) { // dimension 0 of maxpool kernel
+                        for j in 0..(ldif) { // dimension 1 of maxpool kernel
+                            let temp = a.tensor.get(&[i + l*l2dif, j+ k*ldif, m]);
                             if temp > max {
                                 max = temp;
                                 maxind = [i + l, j+ k, m];
@@ -1305,6 +1388,23 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
                         }
                     }
                     a.grad.set(&maxind, root.grad.get(&[l,k]));
+                }
+            }
+        }
+        root.left = Some(backward(a));
+    } else if root.op == "sum_dim" {
+        let mut a = root.left.unwrap();
+        // let mm = a.tensor.shape[a.tensor.shape.len()-1];
+        // for g in 0..root.grad.data.len() {
+        //     for m in 0..mm {
+        //         a.grad.data[mm*g + m] = root.grad.data[g]
+        //     }
+        // }
+        for i in 0..a.tensor.shape[0] {
+            for j in 0..a.tensor.shape[1] {
+                let g = root.grad.get(&[i,j]);
+                for k in 0..a.tensor.shape[2] {
+                    a.tensor.set(&[i,j,k], g);
                 }
             }
         }
@@ -1322,24 +1422,30 @@ fn _simple(dim0: usize, dim1: usize) -> Box<Node> {
 
     // let l1 = linear(x_node, 100);
     // let s1 = sigmoid(l1);
-    // let d1 = dropout(s1, 0.1);
-    // let l2 = linear(d1, 10);
+    // let l2 = linear(s1, 10);
     // log_softmax(l2)
 
     let r1 = reshape_node(x_node, vec![28,28]);
-    let c1 = conv2d(r1, vec![5,5], 10);
-    let re1 = relu(c1);
-    let m1 = max_pool(re1, vec![2,2]);
-    let r2 = flatten(m1);
-    let d1 = dropout(r2, 0.1);
-    // // let l1 = linear(d1, 128);
-    // // let s1 = sigmoid(l1);
-    let l2 = linear(d1, 10);
+    let c1 = conv2d(r1, vec![5,5], 32);
+    // let re1 = relu(c1);
+    // let m1 = max_pool(re1, vec![4,4]);
+    // let c2 = conv2d(m1, vec![3,3], 10);
+    // let re2 = relu(c2);
+    // let m2 = max_pool(re2, vec![2,2]);
+    let sd = _sum_dim(c1);
+    let r2 = flatten(sd);
+    // let d1 = dropout(r2, 0.1);
+    // let l1 = linear(r2, 128);
+    // let s1 = sigmoid(l1);
+    let l2 = linear(r2, 10);
     log_softmax(l2)
 
-    // let l1 = conv2d(x_node, vec![dim0,dim1], 10);
-    // let l2 = flatten(l1);
-    // log_softmax(l2)
+    // let l1 = conv2d(x_node, vec![dim0,dim1], 100);
+    // let f1 = flatten(l1);
+    // let s1 = sigmoid(f1);
+    // let l2 = conv2d(s1, vec![1,100], 10);
+    // let f = flatten(l2);
+    // log_softmax(f)
 }
 
 pub(crate) fn simple() -> std::io::Result<()> {
@@ -1350,7 +1456,7 @@ pub(crate) fn simple() -> std::io::Result<()> {
     // Two different implementations of minibatching.
     // If using one, the other should = 1.
     // batch_size is SAFER but SLOWER than bsz!!! (safer because 2d layers like conv2d and max pool are not set up to handle batched inputs)
-    let batch_size = 64; // each element in training set is a single input, batching is done via batch() function.
+    let batch_size = 1; // each element in training set is a single input, batching is done via batch() function.
     let bsz = 1; // each element in training set is a batch of inputs.
 
 // ========== read in data =============================
@@ -1440,6 +1546,7 @@ pub(crate) fn simple() -> std::io::Result<()> {
     init_best(best_params.as_mut(), out.as_ref());
     let mut batch_grads: Vec<Tensor> = Vec::new();
     init_batch_grads(&mut batch_grads, &out);
+    println!("Starting at {:?}", Utc::now());
     println!("======= START TRAINING =======");
     for epoch in 0..epochs {
         let now = Instant::now();
@@ -1486,6 +1593,7 @@ pub(crate) fn simple() -> std::io::Result<()> {
             total_loss += loss;
         }
         println!("Epoch {} | {} | {} minutes {} seconds", epoch, total_loss / (x_test.len() as f64), mins, extra_seconds);
+        
         if total_loss < best_epoch_loss {
             best_epoch_loss = total_loss;
             best_epoch = epoch;
