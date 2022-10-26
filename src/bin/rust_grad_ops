@@ -15,7 +15,7 @@ use chrono::prelude::*;
 // Maybe use mutable arrays instead of vecs
 // dont think i need separate tensor structs for data and gradients since they will always be the same shape.
 
-// max pooling is probably wring. right now it has stride of 1, but i think its never supposed to overlap
+// RELU appears to be broken right now.
 
 //  ----------------------------------- Data Structures:  -----------------------------------
 
@@ -870,37 +870,15 @@ fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
         root.left = Some(a);
         root.right = Some(drop_node);
     } else if root.op == "relu" {
-        let mut a = forward(root.left.unwrap(), f_data);
-        // if a.tensor.shape.len() == 3 {
-        //     for k in 0..a.tensor.shape[0] {
-        //         for i in 0..a.tensor.l2() {
-        //             for j in 0..a.tensor.l() {
-        //                 if root.tensor.get( &[k,i,j]) < 0.0 {
-        //                     root.tensor.set( &[k,i,j], 0.0);
-        //                 } else {
-        //                     root.tensor.set( &[k,i,j], a.tensor.get(&[k,i,j]));
-        //                 }
-        //             }
-        //         }
-        //     }
-        // } else {
-        //     for i in 0..a.tensor.l2() {
-        //         for j in 0..a.tensor.l() {
-        //             if root.tensor.get( &[i, j]) < 0.0 {
-        //                 root.tensor.set( &[i, j], 0.0);
-        //             } else {
-        //                 root.tensor.set( &[i, j], a.tensor.get(&[i,j]));
-        //             }
-        //         }
-        //     }
-        // }
-        let relued: Vec<f64> = a.tensor.data.iter().map(|e| {
-            if e < &0.0 {
+        let a = forward(root.left.unwrap(), f_data);
+        let mut relued: Vec<f64> = Vec::new();
+        relued.extend(a.tensor.data.iter().map(|e| {
+            if *e < 0.0 {
                 0.0
             } else {
-                e.clone()
-            }}).collect();
-        a.tensor.data = relued;
+                *e
+            }}));
+        root.tensor.data = relued;
         root.left = Some(a);
     } else if root.op == "c2d" {
         let a1 = root.left.unwrap();
@@ -971,6 +949,7 @@ fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
         let a = forward(root.left.unwrap(), f_data);
 
         // println!("start of mp | a shape: {:?} | a datalen: {:?}", a.tensor.shape, a.tensor.data.len());
+        // println!("start of mp | r shape: {:?} | r datalen: {:?}", root.tensor.shape, root.tensor.data.len());
 
         let data = &mut root.tensor;
         // let l2dif = a.tensor.shape[0] - data.shape[0];
@@ -997,7 +976,7 @@ fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
         for m in 0..a.tensor.l() { // filter layer, left intact
             for l in 0..data.shape[0] { // dimension 0 of output
                 for k in 0..data.l2() { // dimension 1 of output
-                    let mut max = 0.0;
+                    let mut max = f64::MIN;
                     for i in 0..(l2dif) { // dimension 0 of maxpool kernel
                         for j in 0..(ldif) { // dimension 1 of maxpool kernel
                             let temp = a.tensor._safe_get(&[i + l*l2dif, j+ k*ldif, m], "maxpool");
@@ -1010,7 +989,15 @@ fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
                 }
             }
         }
+        
+
+        // println!("");
+        // println!("a tens: {:?}", a.tensor.data);
+        // println!("r tens: {:?}", root.tensor.data);
+        // println!("");
+
         root.left = Some(a);
+
     } else if root.op == "sum_dim" {
         let a = forward(root.left.unwrap(), f_data);
         // let mm = a.tensor.shape[a.tensor.shape.len()-1];
@@ -1161,38 +1148,11 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
         root.left = Some(backward(a));
 	} else if root.op == "do" || root.op == "relu" {
         let mut a = root.left.unwrap();
-        if a.tensor.shape.len() == 4 {
-            for q in 0..a.tensor.shape[0] {
-                for k in 0..a.tensor.shape[1] {
-                    for i in 0..a.tensor.l2() {
-                        for j in 0..a.tensor.l() {
-                            if root.tensor.get(&[k,i,j]) > 0.0 {
-                                a.grad.set(&[q,k,i,j], root.grad.get(&[q,k,i,j]));
-                            } 
-                        }
-                    }
-                }
-            }
-        } else if a.tensor.shape.len() == 3 {
-            for k in 0..a.tensor.shape[0] {
-                for i in 0..a.tensor.l2() {
-                    for j in 0..a.tensor.l() {
-                        if root.tensor.get(&[k,i,j]) > 0.0 {
-                            a.grad.set(&[k,i,j], root.grad.get(&[k,i,j]));
-                        } 
-                    }
-                }
-            }
-        } else {
-            for i in 0..a.tensor.l2() {
-                for j in 0..a.tensor.l() {
-                    if root.tensor.get(&[i,j]) > 0.0 {
-                        a.grad.set(&[i, j], root.grad.get(&[i,j]));
-                    } 
-                }
+        for i in 0..a.tensor.data.len() {
+            if a.tensor.data[i] > 0.0 {
+                a.grad.data[i] = root.grad.data[i]
             }
         }
-        
         root.left = Some(backward(a));
     } else if root.op == "c2d" {
         let mut a = root.left.unwrap();
@@ -1376,21 +1336,26 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
         for m in 0..a.tensor.l() { // filter layer, left intact
             for l in 0..data.shape[0] { // dimension 0 of output
                 for k in 0..data.l2() { // dimension 1 of output
-                    let mut max = 0.0;
+                    let mut max = f64::MIN;
                     let mut maxind = [0,0,0];
                     for i in 0..(l2dif) { // dimension 0 of maxpool kernel
                         for j in 0..(ldif) { // dimension 1 of maxpool kernel
                             let temp = a.tensor.get(&[i + l*l2dif, j+ k*ldif, m]);
                             if temp > max {
                                 max = temp;
-                                maxind = [i + l, j+ k, m];
+                                maxind = [i + l*l2dif, j+ k*ldif, m];
                             }
                         }
                     }
-                    a.grad.set(&maxind, root.grad.get(&[l,k]));
+                    a.grad.set(&maxind, root.grad.get(&[l,k,m]));
                 }
             }
         }
+        // println!("");
+        // println!("a: {:?}", a.grad.data);
+        // println!("r: {:?}", root.grad.data);
+        // println!("");
+
         root.left = Some(backward(a));
     } else if root.op == "sum_dim" {
         let mut a = root.left.unwrap();
@@ -1425,38 +1390,46 @@ fn _simple(dim0: usize, dim1: usize) -> Box<Node> {
     // let l2 = linear(s1, 10);
     // log_softmax(l2)
 
-    let r1 = reshape_node(x_node, vec![28,28]);
-    let c1 = conv2d(r1, vec![5,5], 32);
+    // let r1 = reshape_node(x_node, vec![28,28]);
+    // let c1 = conv2d(r1, vec![5,5], 32);
     // let re1 = relu(c1);
     // let m1 = max_pool(re1, vec![4,4]);
-    // let c2 = conv2d(m1, vec![3,3], 10);
-    // let re2 = relu(c2);
-    // let m2 = max_pool(re2, vec![2,2]);
-    let sd = _sum_dim(c1);
-    let r2 = flatten(sd);
-    // let d1 = dropout(r2, 0.1);
-    // let l1 = linear(r2, 128);
-    // let s1 = sigmoid(l1);
-    let l2 = linear(r2, 10);
-    log_softmax(l2)
+    
+    // // let c2 = conv2d(m1, vec![3,3], 10);
+    // // let re2 = relu(c2);
+    // // let m2 = max_pool(re2, vec![2,2]);
+    // let sd = _sum_dim(m1);
+    // let r2 = flatten(sd);
+    // let s1 = sigmoid(r2);
+    // // let d1 = dropout(r2, 0.1);
+    // // let l1 = linear(r2, 128);
+    // // let s1 = sigmoid(l1);
+    // let l2 = linear(s1, 10);
+    // // let s2 = sigmoid(l2);
+    // log_softmax(l2)
 
-    // let l1 = conv2d(x_node, vec![dim0,dim1], 100);
-    // let f1 = flatten(l1);
-    // let s1 = sigmoid(f1);
-    // let l2 = conv2d(s1, vec![1,100], 10);
-    // let f = flatten(l2);
-    // log_softmax(f)
+
+    let r = reshape_node(x_node, vec![28,28]);
+    let c = conv2d(r, vec![3,3], 32);
+    let r1 = relu(c);
+    let m = max_pool(r1, vec![2,2]);
+    // let s = _sum_dim(m);
+    let f = flatten(m);
+    let l1 = linear(f, 100);
+    let s1 = sigmoid(l1);
+    let l2 = linear(s1, 10);
+    log_softmax(l2)
 }
 
 pub(crate) fn simple() -> std::io::Result<()> {
-    let dataset_size = 5120; // default: 51200
+    let dataset_size = 51200; // default: 51200
     let lr = 0.001; // default: 0.001
     let epochs = 10;
 
     // Two different implementations of minibatching.
     // If using one, the other should = 1.
     // batch_size is SAFER but SLOWER than bsz!!! (safer because 2d layers like conv2d and max pool are not set up to handle batched inputs)
-    let batch_size = 1; // each element in training set is a single input, batching is done via batch() function.
+    let batch_size = 64; // each element in training set is a single input, batching is done via batch() function.
     let bsz = 1; // each element in training set is a batch of inputs.
 
 // ========== read in data =============================
