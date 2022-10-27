@@ -183,12 +183,29 @@ impl Tensor {
         self.data[index] = elem;
     }
 
+    // Assuming data is a 2d matrix, get length of outer dimension
     fn l2(&self) -> usize {
-        self.shape[self.shape.len()-2]
+        // self.shape[self.shape.len()-2]
+        self.shape[1]
     }
 
+    // Assuming data is a 2d matrix, get length of inner dimension
     fn l(&self) -> usize {
-        self.shape[self.shape.len()-1]
+        // self.shape[self.shape.len()-1]
+        self.shape[2]
+    }
+
+    // Get length of batch dimension
+    fn bsz(&self) -> usize {
+        self.shape[0]
+    }
+
+    // Get length of channels/filters dimension 
+    fn chans(&self) -> usize {
+        if self.shape.len() < 4 {
+            panic!("Tensor of shape {:?} does not have channels", self.shape);
+        }
+        self.shape[3]
     }
 
     fn copy_tens(&self) -> Tensor {
@@ -240,6 +257,20 @@ fn _add_same_size_fast(a: &Tensor, b: &Tensor ) -> Tensor {
     }
 }
 
+fn _add_bsz_times(a: &Tensor, b: &Tensor ) -> Tensor {
+    let mut f: Vec<f64> = Vec::new();
+    for batch in 0..a.bsz() {
+        f.extend::<Vec<f64>>(zip(
+            a.data[a._get_ind(&[batch,0,0])..a._get_ind(&[batch+1,0,0])].iter(),
+            b.data.iter(),
+        ).map(|(&aa, &bb)| {aa + bb}).collect());
+    }
+    Tensor {
+        data: f,
+        shape: a.shape.to_vec(),
+        diminc: a.diminc.to_vec(),
+    }
+}
 //  ----------------------------------- BASIC OPS:  -----------------------------------
 
 // Inputs, weights, etc
@@ -271,9 +302,9 @@ fn weight(shaper: Vec<usize>) -> Box<Node> {
 }
 
 // Add two identically shaped tensors
-fn add(node1: Box<Node>, node2: Box<Node>) -> Box<Node> { //&'a 
-	let zero_grad = Tensor::ones(&node1.tensor.shape);
-	let data = Tensor::zeros(&node1.tensor.shape);
+fn add(node1: Box<Node>, node2: Box<Node>) -> Box<Node> { //assuming right is batched input 
+	let zero_grad = Tensor::ones(&node2.tensor.shape);
+	let data = Tensor::zeros(&node2.tensor.shape);
 	Box::new(Node{
         left: Some(node1), 
         right: Some(node2), 
@@ -286,8 +317,9 @@ fn add(node1: Box<Node>, node2: Box<Node>) -> Box<Node> { //&'a
 
 // Matrix Multiplication
 fn matmul(a: Box<Node>, x: Box<Node>) -> Box<Node> {
-	let zero_grad = Tensor::ones(&vec![x.tensor.l2(), a.tensor.l2()]);
-	let data = Tensor::zeros(&vec![x.tensor.l2(), a.tensor.l2()]);
+    assert!(x.tensor.l2() == 1);
+	let zero_grad = Tensor::ones(&vec![x.tensor.bsz(), 1, a.tensor.l2()]);
+	let data = Tensor::zeros(&vec![x.tensor.bsz(), 1, a.tensor.l2()]);
 	Box::new(Node{
         left: Some(a), 
         right: Some(x), 
@@ -330,10 +362,10 @@ fn _batch_norm(a: Box<Node>)-> Box<Node> {
 
 // Linear layer. Returns output, weight, bias so that weight and bias can be put in params[].
 fn linear(inn: Box<Node>, out_dim: usize) -> Box<Node> { //  Node<'a>,  Node<'a>) {
-	let l_weight = weight(vec![out_dim, inn.tensor.l()]);
-	let bias = weight(vec![inn.tensor.l2(), out_dim]);
+	let l_weight = weight(vec![1,out_dim,inn.tensor.l()]);
+	let bias = weight(vec![1, 1, out_dim]);
 	let in_times_weight = matmul(l_weight,inn);
-	let plus_bias = add(in_times_weight, bias);
+	let plus_bias = add(bias, in_times_weight);
 	plus_bias
 }
 
@@ -469,16 +501,20 @@ fn flatten(inn: Box<Node>) -> Box<Node> {
 //  ----------------------------------- LOSS AND OPTIM:  -----------------------------------
 
 // Negative Log Likelihood. Takes prediction tensor and target tensor as inputs, returns loss, and updates gradients from input
-fn nll_loss(pred: &mut Box<Node>, target: &Tensor) -> f64 { // mut gradients: Box<Tensor>
+fn nll_loss(pred: &mut Box<Node>, target: &Tensor) -> f64 { 
+    // println!("pred {} | {:?}", pred.tensor.data.len(), pred.tensor.shape);
+    // println!("target {} | {:?}", target.data.len(), target.shape);
 	let mut loss = 0.0;
-	for j in 0..target.l2() {
-		for i in 0..target.l() {
-			let t = target.get( &[j, i]);
-			loss -= t * pred.tensor.get( &[j, i]);
-			pred.grad.set( &[j, i], t);
-		}
-	}
-    loss  / (target.l2() as f64)
+	for b in 0..target.bsz() {
+        for j in 0..target.l2() {
+            for i in 0..target.l() {
+                let t = target.get(&[b,j,i]);
+                loss -= t * pred.tensor.get(&[b,j,i]);
+                pred.grad.set(&[b,j,i], t);
+            }
+        }
+    }
+    loss  / (target.bsz() as f64)
 }
 
 // initialize adam optimizer
@@ -528,51 +564,69 @@ impl Adam {
             // println!("m1 {:?}", prev_m1.shape);
             // println!("m2 {:?}", prev_m2.shape);
             // println!("grad {:?}", w.grad.shape);
-            if w.grad.shape.len() == 2 {
-                for i in 0..w.grad.l2() {
-                    for j in 0..w.grad.l() {
-                        w.grad.set( &[i,j], w.grad.get( &[i,j])/bsz); // get mean gradient of batch
-                        //-gradient--clipping-
-                        if w.grad.get( &[i,j]) > 1.0 {
-                            w.grad.set( &[i,j], 1.0);
-                        }
-                        if w.grad.get( &[i,j]) < -1.0 {
-                            w.grad.set( &[i,j], -1.0);
-                        }
-                        //-------------------
-                        let m1 = prev_m1.get( &[i,j]);
-                        let m2 = prev_m2.get( &[i,j]);
-                        let biased_m1 = (m1 * b1) + ((1. - b1) * w.grad.get( &[i,j]));
-                        let biased_m2 = (m2 * b2) + ((1. - b2) * w.grad.get( &[i,j]).powf(2.));
-                        w.tensor.set( &[i,j], w.tensor.get( &[i,j])-(alpha*biased_m1/(biased_m2.sqrt()+epsilon)));
-                        prev_m1.set( &[i,j], biased_m1);
-                        prev_m2.set( &[i,j], biased_m2);
-                    }
+            // if w.grad.shape.len() == 2 {
+            //     for i in 0..w.grad.shape[0] {
+            //         for j in 0..w.grad.shape[1] {
+            //             w.grad.set( &[i,j], w.grad.get( &[i,j])/bsz); // get mean gradient of batch
+            //             //-gradient--clipping-
+            //             if w.grad.get( &[i,j]) > 1.0 {
+            //                 w.grad.set( &[i,j], 1.0);
+            //             }
+            //             if w.grad.get( &[i,j]) < -1.0 {
+            //                 w.grad.set( &[i,j], -1.0);
+            //             }
+            //             //-------------------
+            //             let m1 = prev_m1.get( &[i,j]);
+            //             let m2 = prev_m2.get( &[i,j]);
+            //             let biased_m1 = (m1 * b1) + ((1. - b1) * w.grad.get( &[i,j]));
+            //             let biased_m2 = (m2 * b2) + ((1. - b2) * w.grad.get( &[i,j]).powf(2.));
+            //             w.tensor.set( &[i,j], w.tensor.get( &[i,j])-(alpha*biased_m1/(biased_m2.sqrt()+epsilon)));
+            //             prev_m1.set( &[i,j], biased_m1);
+            //             prev_m2.set( &[i,j], biased_m2);
+            //         }
+            //     }
+            // } else if w.grad.shape.len() == 3 {
+            //     for k in 0..w.grad.shape[0] {
+            //         for i in 0..w.grad.shape[1] {
+            //             for j in 0..w.grad.shape[2] {
+            //                 w.grad.set( &[k,i,j], w.grad.get( &[k,i,j])/bsz); // get mean gradient of batch
+            //                 //-gradient--clipping-
+            //                 if w.grad.get( &[k,i,j]) > 1.0 {
+            //                     w.grad.set( &[k,i,j], 1.0);
+            //                 }
+            //                 if w.grad.get( &[k,i,j]) < -1.0 {
+            //                     w.grad.set( &[k,i,j], -1.0);
+            //                 }
+            //                 //-------------------
+            //                 let m1 = prev_m1.get( &[k,i,j]);
+            //                 let m2 = prev_m2.get( &[k,i,j]);
+            //                 let biased_m1 = (m1 * b1) + ((1. - b1) * w.grad.get( &[k,i,j]));
+            //                 let biased_m2 = (m2 * b2) + ((1. - b2) * w.grad.get( &[k,i,j]).powf(2.));
+            //                 w.tensor.set( &[k,i,j], w.tensor.get( &[k,i,j])-(alpha*biased_m1/(biased_m2.sqrt()+epsilon)));
+            //                 prev_m1.set( &[k,i,j], biased_m1);
+            //                 prev_m2.set( &[k,i,j], biased_m2);
+            //             }
+            //         }
+            //     }
+            // }
+            
+            for e in 0..w.grad.data.len() {
+                w.grad.data[e] =  w.grad.data[e] / bsz; // get mean gradient of batch
+                //-gradient--clipping-
+                if w.grad.data[e] > 1.0 {
+                    w.grad.data[e] = 1.0;
                 }
-            } else {
-                for k in 0..w.grad.shape[0] {
-                    for i in 0..w.grad.l2() {
-                        for j in 0..w.grad.l() {
-                            // println!("tot: {}, k: {}, i: {}, j: {}", prev_m1._get_ind(&[k,i,j]), k, i, j);
-                            w.grad.set( &[k,i,j], w.grad.get( &[k,i,j])/bsz); // get mean gradient of batch
-                            //-gradient--clipping-
-                            if w.grad.get( &[k,i,j]) > 1.0 {
-                                w.grad.set( &[k,i,j], 1.0);
-                            }
-                            if w.grad.get( &[k,i,j]) < -1.0 {
-                                w.grad.set( &[k,i,j], -1.0);
-                            }
-                            //-------------------
-                            let m1 = prev_m1.get( &[k,i,j]);
-                            let m2 = prev_m2.get( &[k,i,j]);
-                            let biased_m1 = (m1 * b1) + ((1. - b1) * w.grad.get( &[k,i,j]));
-                            let biased_m2 = (m2 * b2) + ((1. - b2) * w.grad.get( &[k,i,j]).powf(2.));
-                            w.tensor.set( &[k,i,j], w.tensor.get( &[k,i,j])-(alpha*biased_m1/(biased_m2.sqrt()+epsilon)));
-                            prev_m1.set( &[k,i,j], biased_m1);
-                            prev_m2.set( &[k,i,j], biased_m2);
-                        }
-                    }
+                if w.grad.data[e] < -1.0 {
+                    w.grad.data[e]=  -1.0;
                 }
+                //-------------------
+                let m1 = prev_m1.data[e];
+                let m2 = prev_m2.data[e];
+                let biased_m1 = (m1 * b1) + ((1. - b1) * w.grad.data[e]);
+                let biased_m2 = (m2 * b2) + ((1. - b2) * w.grad.data[e].powf(2.));
+                w.tensor.data[e] =  w.tensor.data[e]-(alpha*biased_m1/(biased_m2.sqrt()+epsilon));
+                prev_m1.data[e] =  biased_m1;
+                prev_m2.data[e] = biased_m2;
             }
             k += 1
         }
@@ -766,15 +820,20 @@ fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
         let a1 = root.left.unwrap();
 		let x1 = root.right.unwrap();
         let (left,right) = rayon::join(|| forward(a1, f_data), || forward(x1, f_data));
-
-        root.tensor = _add_same_size_fast(&right.tensor, &left.tensor);
-
+        root.tensor.shape[0] = right.tensor.shape[0];
+        root.tensor = _add_bsz_times(&right.tensor, &left.tensor); // Assuming right tensor, aka x, is batched input
         root.left = Some(left);
         root.right = Some(right);
 	} else if root.op == "mm" { // matmul
         let a1 = root.left.unwrap();
 		let x1 = root.right.unwrap();
         let (a,x) = rayon::join(|| forward(a1, f_data), || forward(x1, f_data));
+        root.tensor.shape[0] = x.tensor.shape[0];
+        // println!("r: {:?}", root.tensor.shape);
+        // println!("x: {:?}", x.tensor.shape);
+        // println!("a: {:?}", a.tensor.shape);
+
+
         // let data = &mut root.tensor;
         // println!("a {:?}", a.tensor.shape);
         // println!("x {:?}", x.tensor.shape);
@@ -804,12 +863,12 @@ fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
         // root.tensor.data = v;
 
         let mut v: Vec<f64> = Vec::new();
-        let jj = a.tensor.l(); 
-        for k in 0..x.tensor.l2() {
-            v.extend::<Vec<f64>>((0..a.tensor.l2()).into_par_iter().map( |i| {
+        let jj = x.tensor.l(); 
+        for i in 0..x.tensor.bsz() { // for each batch
+            v.extend::<Vec<f64>>((0..a.tensor.l2()).into_par_iter().map( |k| { // for each node
                 zip(
-                    &a.tensor.data[a.tensor._get_ind(&[i, 0])..a.tensor._get_ind(&[i, jj])], 
-                    &x.tensor.data[x.tensor._get_ind(&[k, 0])..x.tensor._get_ind(&[k, jj])]
+                    &x.tensor.data[x.tensor._get_ind(&[i,0,0])..x.tensor._get_ind(&[i,0,jj])], // get the vector of the current batch
+                    &a.tensor.data[a.tensor._get_ind(&[0,k,0])..a.tensor._get_ind(&[0,k,jj])] // get the vector of the current node
                 ).map(|(a,x)| {a * x}).sum()
             }).collect()); 
         }
@@ -820,30 +879,42 @@ fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
        
 	} else if root.op == "sm" { // Log Softmax
 		let a = forward(root.left.unwrap(), f_data);
-		for i in 0..a.tensor.l2() {
+        // println!("a {} | {:?}", a.tensor.data.len(), a.tensor.shape);
+        root.tensor.shape[0] = a.tensor.shape[0];
+        root.tensor.data = vec![0.0; a.tensor.data.len()];
+        // println!("r {} | {:?}", root.tensor.data.len(), root.tensor.shape);
+		for b in 0..a.tensor.bsz() {
 			let mut layer_sum: f64 = 0.0;
 			let mut layer_max: f64 = 0.0000001;
 			// layer_max is for normalization
-			for j in 0..a.tensor.l() {
-				if a.tensor.get( &[i, j]) > layer_max {
-					layer_max = a.tensor.get( &[i, j])
-				}
-			}
-			for j in 0..a.tensor.l() {
-				layer_sum += (a.tensor.get( &[i, j]) - layer_max).exp();
-			}
-			for j in 0..a.tensor.l() {
-				root.tensor.set( &[i, j], a.tensor.get( &[i, j]) - layer_sum.ln() - layer_max)
-			}
+            for i in 0..a.tensor.l2() {
+                for j in 0..a.tensor.l() {
+                    if a.tensor.get( &[b,i,j]) > layer_max {
+                        layer_max = a.tensor.get( &[b,i,j])
+                    }
+                }
+            }
+            for i in 0..a.tensor.l2() {
+                for j in 0..a.tensor.l() {
+                    layer_sum += (a.tensor.get( &[b,i,j]) - layer_max).exp();
+                }
+            }
+            for i in 0..a.tensor.l2() {
+                for j in 0..a.tensor.l() {
+                    root.tensor.set( &[b,i,j], a.tensor.get( &[b,i,j]) - layer_sum.ln() - layer_max)
+                }
+            }
 		}
         root.left = Some(a);
 	} else if root.op == "sig" { // Sigmoid
 		let a = forward(root.left.unwrap(), f_data);
-		for i in 0..a.tensor.l2() {
-			for j in 0..a.tensor.l() {
-				root.tensor.set( &[i, j], 1.0/(1.0 + (-1.0*a.tensor.get( &[i, j])).exp()));
-			}
-		}
+        for b in 0..a.tensor.bsz() {
+            for i in 0..a.tensor.l2() {
+                for j in 0..a.tensor.l() {
+                    root.tensor.set( &[b,i,j], 1.0/(1.0 + (-1.0*a.tensor.get( &[b,i,j])).exp()));
+                }
+            }
+        }
         root.left = Some(a);
 	} else if root.op == "do" {
         let a = forward(root.left.unwrap(), f_data);
@@ -1053,15 +1124,36 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
     };
 	if root.op == "+" { // add
 		// Return tensor a + b
-        let mut left = root.left.unwrap();
-		let mut right = root.right.unwrap();
-		left.grad = root.grad.copy_tens();
-        right.grad = root.grad.copy_tens();
-        root.left = Some(backward(left));
-        root.right = Some(backward(right));
+        let mut a = root.left.unwrap();
+		let mut x = root.right.unwrap(); // Assuming right is batched input
+        // let bias_data = Vec::new();
+		// left.grad = root.grad.copy_tens();
+        // right.grad = root.grad.copy_tens();
+        // root.left = Some(backward(left));
+        // root.right = Some(backward(right));
+        let jj = a.grad.l(); 
+        // let mut va: Vec<f64> = Vec::new();
+        // va.extend::<Vec<f64>>((0..jj).into_par_iter().map( |j| { // for each coefficient
+        //     &mut root.grad.data[j..].iter().step_by(jj).sum()
+        // })); 
+        let mut va: Vec<f64> = Vec::new();
+        (0..jj).into_par_iter().map( |j| { // for each coefficient
+            root.grad.data[j..].iter().step_by(jj).sum()
+        }).collect_into_vec(&mut va); 
+        a.grad.data = va;
+        if x.require_grad {
+           x.grad = root.grad.copy_tens();
+        }
+        let (a1,x1) = rayon::join(|| backward(a), || backward(x));
+        root.left = Some(a1);
+        root.right = Some(x1);
 	} else if root.op == "mm" { // matmul
         let mut a = root.left.unwrap();
 		let mut x = root.right.unwrap();
+
+        // println!("r: {:?}", root.grad.shape);
+        // println!("x: {:?}", x.grad.shape);
+        // println!("a: {:?}", a.grad.shape);
 
 		// for i in 0..a.tensor.l2() {
         //     for k in 0..x.tensor.l2() {
@@ -1101,50 +1193,55 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
         // }
         // x.grad.data = vx;
 
-        let jj = a.tensor.l(); 
-        let aa = a.tensor.l2();
-        let rr = root.tensor.l();
+        let jj = x.tensor.l(); 
         let mut va: Vec<f64> = Vec::new();
-        if a.require_grad {
-            for i in 0..a.tensor.l2() {
-                va.extend::<Vec<f64>>((0..jj).into_par_iter().map( |j| {
-                    zip(
-                        &mut x.tensor.data[j..].iter().step_by(jj),
-                        &mut root.grad.data[i..].iter().step_by(rr)
-                    ).map(|(x,r)| {x * r}).sum()
-                }).collect()); 
-            }
-            a.grad.data = va;
-        }
-        let mut vx: Vec<f64> = Vec::new();
-        for k in 0..x.tensor.l2() {
-            vx.extend::<Vec<f64>>((0..jj).into_par_iter().map( |j| {
+        for k in 0..a.tensor.l2() {
+            va.extend::<Vec<f64>>((0..a.tensor.l()).into_par_iter().map( |j| { // for each coefficient
                 zip(
-                    &mut a.tensor.data[j..].iter().step_by(jj),
-                    &root.grad.data[root.grad._get_ind(&[k, 0])..root.grad._get_ind(&[k,aa])]
-                ).map(|(a,r)| {a * r}).sum()
+                    &mut x.tensor.data[j..].iter().step_by(jj), // for each batch, get the element that is multiplied by the current coefficient j
+                    &mut root.grad.data[k..].iter().step_by(x.tensor.bsz()) // for each batch, get the gradient of the current node k
+                ).map(|(x,r)| {x * r}).sum()
             }).collect()); 
         }
-        x.grad.data = vx;
-        
+        a.grad.data = va;
+        if x.require_grad {
+            let mut vx: Vec<f64> = Vec::new();
+            for b in 0..x.tensor.bsz() {
+                vx.extend::<Vec<f64>>((0..x.tensor.l()).into_par_iter().map( |j| { // for each element in input
+                    zip(
+                        &mut a.tensor.data[j..].iter().step_by(jj), //for each node, get the coefficient for the current element of a
+                        & root.grad.data[
+                            root.grad._get_ind(&[b, 0, 0]).. 
+                            root.grad._get_ind(&[b, 0, a.tensor.l2()])
+                        ] // also get the gradient of that node for the current batch
+                    
+                    ).map(|(a,r)| {a * r}).sum()
+                }).collect()); 
+            }
+            x.grad.data = vx;
+        }
         let (a1,x1) = rayon::join(|| backward(a), || backward(x));
         root.left = Some(a1);
         root.right = Some(x1);
 	} else if root.op == "sm" { // Log Softmax
 		let mut a = root.left.unwrap();
-		for i in 0..root.tensor.l2() {
-			for j in 0..root.tensor.l() {
-				a.grad.set( &[i, j], -1.*(root.grad.get( &[i, j])-root.tensor.get( &[i, j]).exp()))
-			}
-		}
+        for b in 0..root.tensor.bsz() {
+            for i in 0..root.tensor.l2() {
+                for j in 0..root.tensor.l() {
+                    a.grad.set( &[b,i,j], -1. * (root.grad.get(&[b,i,j]) - root.tensor.get(&[b,i,j]).exp()))
+                }
+            }
+        }
         root.left = Some(backward(a));
 	} else if root.op == "sig" { // Sigmoid
 		let mut a = root.left.unwrap();
-		for i in 0..root.tensor.l2() {
-			for j in 0..root.tensor.l() {
-				a.grad.set( &[i, j], root.tensor.get( &[i, j]) * (1.0 - root.tensor.get( &[i, j])) * root.grad.get( &[i, j]));
-			}
-		}
+        for b in 0..root.tensor.bsz() {
+            for i in 0..root.tensor.l2() {
+                for j in 0..root.tensor.l() {
+                    a.grad.set( &[b,i,j], root.tensor.get( &[b,i,j]) * (1.0 - root.tensor.get( &[b,i,j])) * root.grad.get( &[b,i,j]));
+                }
+            }
+        }
         root.left = Some(backward(a));
 	} else if root.op == "do" || root.op == "relu" {
         let mut a = root.left.unwrap();
@@ -1380,10 +1477,13 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
 
 // ----------------------------------- TESTING (will be removed when done) -----------------------------------
 
-fn _simple(dim0: usize, dim1: usize) -> Box<Node> {
-    let x_placeholder = Tensor::zeros(&vec![dim0, dim1]);
+fn _simple(shaper: &Vec<usize>) -> Box<Node> {
+    let x_placeholder = Tensor::zeros(shaper);
 	let mut x_node = leaf(x_placeholder, false);
     x_node.op = "input";
+
+    let l1 = linear(x_node, 10);
+    log_softmax(l1)
 
     // let l1 = linear(x_node, 100);
     // let s1 = sigmoid(l1);
@@ -1391,34 +1491,29 @@ fn _simple(dim0: usize, dim1: usize) -> Box<Node> {
     // log_softmax(l2)
 
     // let r1 = reshape_node(x_node, vec![28,28]);
-    // let c1 = conv2d(r1, vec![5,5], 32);
+    // let c1 = conv2d(r1, vec![3,3], 64);
     // let re1 = relu(c1);
-    // let m1 = max_pool(re1, vec![4,4]);
-    
-    // // let c2 = conv2d(m1, vec![3,3], 10);
-    // // let re2 = relu(c2);
+    // let m1 = max_pool(re1, vec![2,2]);
+    // let c2 = conv2d(m1, vec![3,3], 32);
+    // let re2 = relu(c2);
     // // let m2 = max_pool(re2, vec![2,2]);
-    // let sd = _sum_dim(m1);
-    // let r2 = flatten(sd);
-    // let s1 = sigmoid(r2);
-    // // let d1 = dropout(r2, 0.1);
-    // // let l1 = linear(r2, 128);
-    // // let s1 = sigmoid(l1);
+    // let r2 = flatten(re2);
+    // let l1 = linear(r2, 100);
+    // let s1 = sigmoid(l1);
     // let l2 = linear(s1, 10);
-    // // let s2 = sigmoid(l2);
     // log_softmax(l2)
 
 
-    let r = reshape_node(x_node, vec![28,28]);
-    let c = conv2d(r, vec![3,3], 32);
-    let r1 = relu(c);
-    let m = max_pool(r1, vec![2,2]);
-    // let s = _sum_dim(m);
-    let f = flatten(m);
-    let l1 = linear(f, 100);
-    let s1 = sigmoid(l1);
-    let l2 = linear(s1, 10);
-    log_softmax(l2)
+    // let r = reshape_node(x_node, vec![28,28]);
+    // let c = conv2d(r, vec![3,3], 32);
+    // let r1 = relu(c);
+    // let m = max_pool(r1, vec![2,2]);
+    // // let s = _sum_dim(m);
+    // let f = flatten(m);
+    // let l1 = linear(f, 100);
+    // let s1 = sigmoid(l1);
+    // let l2 = linear(s1, 10);
+    // log_softmax(l2)
 }
 
 pub(crate) fn simple() -> std::io::Result<()> {
@@ -1429,8 +1524,8 @@ pub(crate) fn simple() -> std::io::Result<()> {
     // Two different implementations of minibatching.
     // If using one, the other should = 1.
     // batch_size is SAFER but SLOWER than bsz!!! (safer because 2d layers like conv2d and max pool are not set up to handle batched inputs)
-    let batch_size = 64; // each element in training set is a single input, batching is done via batch() function.
-    let bsz = 1; // each element in training set is a batch of inputs.
+    let _batch_size = 1; // each element in training set is a single input, batching is done via batch() function.
+    let bsz = 64; // each element in training set is a batch of inputs.
 
 // ========== read in data =============================
     let file = File::open("mnist_train.csv")?;
@@ -1454,13 +1549,13 @@ pub(crate) fn simple() -> std::io::Result<()> {
     let mut last_ind = 0;
     for b in 0..(dataset_size / bsz) {
         // let data_slice = &data[b];
-        let mut x = Tensor::zeros(&vec![bsz,784]);
-        let mut y = Tensor::zeros(&vec![bsz,10]);
-        for e in 0..bsz {
-            let data_slice = &data[b*bsz + e];
-            y.set( &[e, data_slice[0].parse::<usize>().unwrap()], 1.0);
+        let mut x = Tensor::zeros(&vec![bsz,1,784]);
+        let mut y = Tensor::zeros(&vec![bsz,1,10]);
+        for e in 0..x.bsz() {
+            let data_slice = &data[b*x.bsz() + e];
+            y.set( &[e,0,data_slice[0].parse::<usize>().unwrap()], 1.0);
             for i in 1..(x.l()+1) {
-                x.set( &[e,i-1], data_slice[i].parse::<f64>().unwrap() / 255.0);
+                x.set( &[e,0,i-1], data_slice[i].parse::<f64>().unwrap() / 255.0);
             }
         }
         x_train.push(x);
@@ -1470,15 +1565,15 @@ pub(crate) fn simple() -> std::io::Result<()> {
 
     let mut x_test = Vec::new();
     let mut y_test = Vec::new();
-    for b in 0..((x_train.len()/10+1)/bsz) {
+    for b in 0..((x_train.len()/10+1)) { // /bsz
         // let data_slice = &data[b + last_ind];
-        let mut x = Tensor::zeros(&vec![bsz,784]);
-        let mut y = Tensor::zeros(&vec![bsz,10]);
-        for e in 0..bsz {
-            let data_slice = &data[(last_ind+b)*bsz + e];
-            y.set( &[e, data_slice[0].parse::<usize>().unwrap()], 1.0);
+        let mut x = Tensor::zeros(&vec![1,1,784]);
+        let mut y = Tensor::zeros(&vec![1,1,10]);
+        for e in 0..x.bsz() {
+            let data_slice = &data[(last_ind+b)*x.bsz() + e];
+            y.set( &[e,0,data_slice[0].parse::<usize>().unwrap()], 1.0);
             for i in 1..(x.l()+1) {
-                x.set( &[e,i-1], data_slice[i].parse::<f64>().unwrap() / 255.0);
+                x.set( &[e,0,i-1], data_slice[i].parse::<f64>().unwrap() / 255.0);
             }
         }
         x_test.push(x);
@@ -1487,15 +1582,15 @@ pub(crate) fn simple() -> std::io::Result<()> {
 
     let mut x_val = Vec::new();
     let mut y_val = Vec::new();
-    for b in 0..(10000/bsz) {
+    for b in 0..(10000) {
         // let data_slice = &data2[b];
-        let mut x = Tensor::zeros(&vec![bsz,784]);
-        let mut y = Tensor::zeros(&vec![bsz,10]);
-        for e in 0..bsz {
-            let data_slice = &data2[b*bsz + e];
-            y.set( &[e, data_slice[0].parse::<usize>().unwrap()], 1.0);
+        let mut x = Tensor::zeros(&vec![1,1,784]);
+        let mut y = Tensor::zeros(&vec![1,1,10]);
+        for e in 0..x.bsz() {
+            let data_slice = &data2[b*x.bsz() + e];
+            y.set( &[e,0,data_slice[0].parse::<usize>().unwrap()], 1.0);
             for i in 1..(x.l()+1) {
-                x.set( &[e,i-1], data_slice[i].parse::<f64>().unwrap() / 255.0);
+                x.set( &[e,0,i-1], data_slice[i].parse::<f64>().unwrap() / 255.0);
             }
         }
         x_val.push(x);
@@ -1504,7 +1599,7 @@ pub(crate) fn simple() -> std::io::Result<()> {
 // =========================================================
 
 
-    let mut out = _simple(bsz, 784);
+    let mut out = _simple(&x_train[0].shape);
     let mut opt = Adam {
         t: 0.0, 
         alpha: lr, 
@@ -1527,11 +1622,17 @@ pub(crate) fn simple() -> std::io::Result<()> {
         for i in 0..x_train.len() {
             let x = &x_train[i]; 
             let y = &y_train[i];
+            // println!("staring forward ====");
             out = forward(out, x);
+            // println!("staring loss ====");
             nll_loss(&mut out, y);
+            // println!("staring backward ====");
             out = backward(out);
-            batch(i, &mut batch_grads, &mut out, &mut opt, batch_size, dataset_size, lr);
-
+            // batch(i, &mut batch_grads, &mut out, &mut opt, batch_size, dataset_size, lr);
+            // println!("staring step ====");
+            opt.step(&mut out, bsz as f64, 0);
+            opt.exp_lr_decay(lr, 0.95, x_train.len() as f64);
+            // println!("staring test ====");
 
 
             // if i == x_train.len() - 1  && epoch > 50{  // && epoch == epochs - 1
@@ -1589,31 +1690,31 @@ pub(crate) fn simple() -> std::io::Result<()> {
         let x = &x_val[t]; 
         let y = &y_val[t]; 
         out = forward(out, &x);
-
-        for q in 0..out.tensor.l2() {
-            let mut max_pred = 0.0;
-            let mut max_ind = 0;
-            for p in 0..out.tensor.l() {
-                let temp = out.tensor.get( &[q, p]).exp();
-                if temp > max_pred {
-                    max_pred = temp;
-                    max_ind = p;
+        for b in 0..out.tensor.bsz(){
+            for q in 0..out.tensor.l2() {
+                let mut max_pred = 0.0;
+                let mut max_ind = 0;
+                for p in 0..out.tensor.l() {
+                    let temp = out.tensor.get( &[b,q,p]).exp();
+                    if temp > max_pred {
+                        max_pred = temp;
+                        max_ind = p;
+                    }
                 }
-            }
-            let mut y_ind = 0;
-            for p in 0..y.l() {
-                if y.get( &[q,p]) > 0.0 {
-                    y_ind = p;
-                    // break;
+                let mut y_ind = 0;
+                for p in 0..y.l() {
+                    if y.get( &[b,q,p]) > 0.0 {
+                        y_ind = p;
+                        // break;
+                    }
                 }
-            }
-            if max_ind == y_ind {
-                correct += 1;
-            } else {
-                incorrect += 1;
+                if max_ind == y_ind {
+                    correct += 1;
+                } else {
+                    incorrect += 1;
+                }
             }
         }
-
         let loss = nll_loss(&mut out, y);
         total_loss += loss;
     }
