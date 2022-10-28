@@ -243,7 +243,7 @@ impl Tensor {
             incs[i] = temp
         }
         if data_len != self.data.len() {
-            panic!("Shape {:?} is not compatible with Tensor of shape {:?}", shaper, self.shape);
+            panic!("Shape {:?} is not compatible with Tensor of shape {:?} and data length {}", shaper, self.shape, self.data.len());
         }
         self.shape = shaper.to_vec();
         self.diminc = incs;
@@ -351,6 +351,7 @@ fn matmul(weight: Box<Node>, input: Box<Node>) -> Box<Node> {
     })
 }
 
+// Batch size is not included in input shape, since batch size can differ between train/test/val. Correct batch size is automatically used.
 fn reshape_node(inn: Box<Node>, mut shaper: Vec<usize>) -> Box<Node> {
     let mut batched_shaper = vec![inn.tensor.bsz()];
     batched_shaper.append(&mut shaper);
@@ -515,10 +516,11 @@ fn max_pool(inn: Box<Node>, shaper: Vec<usize>) -> Box<Node> {
     })
 }
 
-// take 3 dimensional input, flatten to 1 dimensional vector (actually 2d with 0-dimension of length 1)
+// flatten input to 1 dimensional vector (batch size is maintained, this is handled by reshape_node)
 fn flatten(inn: Box<Node>) -> Box<Node> {
-    let shaper = &inn.tensor.shape;
-    let bigshape = shaper.iter().product();
+    let shaper = inn.tensor.shape.to_vec();
+    let bsz = shaper[0];
+    let bigshape = shaper.iter().product::<usize>() / bsz;
     reshape_node(inn, vec![1, bigshape])
 }
 
@@ -787,7 +789,7 @@ fn shuffle_xy(x: &mut Vec<Tensor>, y: &mut Vec<Tensor>) {
 }
 
 // Make sure current node has correct batch size (useful for when test/val sets have different batch sizes than train set)
-fn _match_bsz(mut root: Box<Node>, input_direction: &str) -> Box<Node>{
+fn _match_bsz(mut root: Box<Node>, input_direction: &str) -> Box<Node> {
     match input_direction {
         "left" => {
             let input = root.left.unwrap();
@@ -809,6 +811,28 @@ fn _match_bsz(mut root: Box<Node>, input_direction: &str) -> Box<Node>{
     };
     root
 }
+
+fn _change_dropout(mut root: Box<Node>, drop_prob: f64) -> Box<Node> {
+    if root.op == "do" {
+        let mut drop_node = root.right.unwrap();
+        drop_node.tensor.data[0] = drop_prob;
+        root.right = Some(drop_node);
+    }
+    match root.left {
+        Some(x) => {
+            root.left = Some(_change_dropout(x, drop_prob));
+        }
+        None => {}
+    }
+    match root.right {
+        Some(x) => {
+            root.right = Some(_change_dropout(x, drop_prob));
+        }
+        None => {}
+    }
+    root
+}
+
 // ----------------------------------- FORWARD AND BACKWARD: -----------------------------------
 
 // These should probably be passing mutable references to the root instead of the root itself.
@@ -1089,21 +1113,23 @@ fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
         //         }
         //     }
         // }
-        let l2dif = input.tensor.shape[0] / data.shape[0];
-        let ldif = input.tensor.l2() / data.l2();
-        for m in 0..input.tensor.l() { // filter layer, left intact
-            for l in 0..data.shape[0] { // dimension 0 of output
-                for k in 0..data.l2() { // dimension 1 of output
-                    let mut max = f64::MIN;
-                    for i in 0..(l2dif) { // dimension 0 of maxpool kernel
-                        for j in 0..(ldif) { // dimension 1 of maxpool kernel
-                            let temp = input.tensor._safe_get(&[i + l*l2dif, j+ k*ldif, m], "maxpool");
-                            if temp > max {
-                                max = temp;
+        let l2dif = input.tensor.l2() / data.l2();
+        let ldif = input.tensor.l() / data.l();
+        for b in 0..input.tensor.bsz() {
+            for m in 0..input.tensor.chans() { // filter layer, left intact
+                for l in 0..data.l2() { // dimension 0 of output
+                    for k in 0..data.l() { // dimension 1 of output
+                        let mut max = f64::MIN;
+                        for i in 0..(l2dif) { // dimension 0 of maxpool kernel
+                            for j in 0..(ldif) { // dimension 1 of maxpool kernel
+                                let temp = input.tensor._safe_get(&[b,i + l*l2dif, j+ k*ldif, m], "maxpool");
+                                if temp > max {
+                                    max = temp;
+                                }
                             }
                         }
+                        data.set(&[b,l, k, m], max);
                     }
-                    data.set(&[l, k, m], max);
                 }
             }
         }
@@ -1152,7 +1178,7 @@ fn forward(mut root: Box<Node>, f_data: &Tensor) -> Box<Node> {
 }
 
 fn backward(mut root: Box<Node>) -> Box<Node>{
-    // println!("back {}", root.op);
+    // println!("back {} | shape {:?}", root.op, root.grad.shape);
 	if !root.require_grad {
 		return root;
 	} 
@@ -1306,8 +1332,8 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
         let mut input = root.left.unwrap();
         let mut kernel = root.right.unwrap();
         // println!("r: {:?}", root.grad.shape);
-        // println!("x: {:?}", x.grad.shape);
-        // println!("a: {:?}", a.grad.shape);
+        // println!("i: {:?}", input.grad.shape);
+        // println!("k: {:?}", kernel.grad.shape);
         // let data = &root.tensor;
         // for m in 0..(x.tensor.l()) { // Filter Layer
         //     for l in 0..data.shape[0] {
@@ -1336,28 +1362,39 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
         let ri = root.tensor.l2();
         
         if input.require_grad {
-            for a1 in 0..input.grad.shape[0] {
-                input_grad.extend::<Vec<f64>>((0..input.grad.shape[1]).into_iter().map( |a2| {
-                    let mut temp:f64 = 0.0;
-                    for i in 0..ii {
-                        for j in 0..jj {
-                            if a1 >= i && a2 >= j && a1 + ii - (i+1) < ai && a2 + jj - (j+1) < aj {
-                                // println!("{} {} | {} {}", x.tensor._get_ind(&[i,j,0]), x.tensor._get_ind(&[i,j,mm]), root.grad._get_ind(&[a1 - i,a2 - j,0]),root.grad._get_ind(&[a1 - i,a2 - j,mm]));
-                                temp += zip(
-                                    &mut kernel.tensor.data[
-                                        kernel.tensor._get_ind(&[i,j,0]).. 
-                                        kernel.tensor._get_ind(&[i,j,mm])
-                                    ].iter(),
-                                    &mut root.grad.data[
-                                        root.grad._get_ind(&[a1 - i,a2 - j,0])..
-                                        root.grad._get_ind(&[a1 - i,a2 - j,mm])
-                                    ].iter()
-                                ).map(|(x,r)| {x * r}).sum::<f64>();
+            for b in 0..input.grad.bsz() {
+                for a1 in 0..input.grad.l2() {
+                    input_grad.extend::<Vec<f64>>((0..input.grad.l()).into_iter().map( |a2| {
+                        let mut temp:f64 = 0.0;
+                        for i in 0..ii {
+                            for j in 0..jj {
+                                if a1 >= i && a2 >= j && a1 + ii - (i+1) < ai && a2 + jj - (j+1) < aj {
+                                    let ktest = &mut kernel.tensor.data[
+                                            kernel.tensor._get_ind(&[0,i,j,0]).. 
+                                            kernel.tensor._get_ind(&[0,i,j,mm])
+                                        ].iter();
+                                    let rtest = &mut root.grad.data[
+                                            root.grad._get_ind(&[b,a1 - i,a2 - j,0])..
+                                            root.grad._get_ind(&[b,a1 - i,a2 - j,mm])
+                                        ].iter();
+                                    assert!(ktest.len() == rtest.len());
+                                    temp += zip(
+                                        ktest, rtest
+                                        // &mut kernel.tensor.data[
+                                        //     kernel.tensor._get_ind(&[i,j,0]).. 
+                                        //     kernel.tensor._get_ind(&[i,j,mm])
+                                        // ].iter(),
+                                        // &mut root.grad.data[
+                                        //     root.grad._get_ind(&[a1 - i,a2 - j,0])..
+                                        //     root.grad._get_ind(&[a1 - i,a2 - j,mm])
+                                        // ].iter()
+                                    ).map(|(x,r)| {x * r}).sum::<f64>();
+                                }
                             }
                         }
-                    }
-                    temp
-                }).collect());   
+                        temp
+                    }).collect());   
+                }
             }
         }
         for i in 0..kernel.tensor.l2() { // Kernel dim 0
@@ -1442,23 +1479,46 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
         //         }
         //     }
         // }
-        let l2dif = input.tensor.shape[0] / data.shape[0];
-        let ldif = input.tensor.l2() / data.l2();
-        for m in 0..input.tensor.l() { // filter layer, left intact
-            for l in 0..data.shape[0] { // dimension 0 of output
-                for k in 0..data.l2() { // dimension 1 of output
-                    let mut max = f64::MIN;
-                    let mut maxind = [0,0,0];
-                    for i in 0..(l2dif) { // dimension 0 of maxpool kernel
-                        for j in 0..(ldif) { // dimension 1 of maxpool kernel
-                            let temp = input.tensor.get(&[i + l*l2dif, j+ k*ldif, m]);
-                            if temp > max {
-                                max = temp;
-                                maxind = [i + l*l2dif, j+ k*ldif, m];
+
+        // let l2dif = input.tensor.shape[0] / data.shape[0];
+        // let ldif = input.tensor.l2() / data.l2();
+        // for m in 0..input.tensor.l() { // filter layer, left intact
+        //     for l in 0..data.shape[0] { // dimension 0 of output
+        //         for k in 0..data.l2() { // dimension 1 of output
+        //             let mut max = f64::MIN;
+        //             let mut maxind = [0,0,0];
+        //             for i in 0..(l2dif) { // dimension 0 of maxpool kernel
+        //                 for j in 0..(ldif) { // dimension 1 of maxpool kernel
+        //                     let temp = input.tensor.get(&[i + l*l2dif, j+ k*ldif, m]);
+        //                     if temp > max {
+        //                         max = temp;
+        //                         maxind = [i + l*l2dif, j+ k*ldif, m];
+        //                     }
+        //                 }
+        //             }
+        //             input.grad.set(&maxind, root.grad.get(&[l,k,m]));
+        //         }
+        //     }
+        // }
+        let l2dif = input.tensor.l2() / data.l2();
+        let ldif = input.tensor.l() / data.l();
+        for b in 0..input.tensor.bsz() {
+            for m in 0..input.tensor.chans() { // filter layer, left intact
+                for l in 0..data.l2() { // dimension 0 of output
+                    for k in 0..data.l() { // dimension 1 of output
+                        let mut max = f64::MIN;
+                        let mut maxind = [0,0,0,0];
+                        for i in 0..(l2dif) { // dimension 0 of maxpool kernel
+                            for j in 0..(ldif) { // dimension 1 of maxpool kernel
+                                let temp = input.tensor._safe_get(&[b,i + l*l2dif, j+ k*ldif, m], "maxpool");
+                                if temp > max {
+                                    max = temp;
+                                    maxind = [b, i + l*l2dif, j+ k*ldif, m];
+                                }
                             }
                         }
+                        input.grad.set(&maxind, root.grad.get(&[b,l,k,m]));
                     }
-                    input.grad.set(&maxind, root.grad.get(&[l,k,m]));
                 }
             }
         }
@@ -1511,33 +1571,38 @@ fn _simple(shaper: &Vec<usize>) -> Box<Node> {
     // log_softmax(f)
 
     
-    let c = conv2d(x_node, vec![1,784], 10, "he");
-    let f = reshape_node(c, vec![1,10]);
-    log_softmax(f)
+    // let c = conv2d(x_node, vec![1,784], 10, "he");
+    // let f = reshape_node(c, vec![1,10]);
+    // log_softmax(f)
 
 
-    // let r1 = reshape_node(x_node, vec![28,28]);
-    // let c1 = conv2d(r1, vec![3,3], 64);
-    // let re1 = relu(c1);
-    // let m1 = max_pool(re1, vec![2,2]);
-    // let c2 = conv2d(m1, vec![3,3], 32);
-    // let re2 = relu(c2);
-    // // let m2 = max_pool(re2, vec![2,2]);
-    // let r2 = flatten(re2);
-    // let l1 = linear(r2, 100);
+    let r1 = reshape_node(x_node, vec![28,28]);
+    let c1 = conv2d(r1, vec![5,5], 64, "he");
+    let re1 = relu(c1);
+    let m1 = max_pool(re1, vec![2,2]);
+    let c2 = conv2d(m1, vec![3,3], 32, "he");
+    let re2 = relu(c2);
+    // let m2 = max_pool(re2, vec![2,2]);
+    let r2 = flatten(re2);
+    // let l1 = linear(r2, 100, "xavier");
     // let s1 = sigmoid(l1);
-    // let l2 = linear(s1, 10);
-    // log_softmax(l2)
+    let l2 = linear(r2, 10, "xavier");
+    log_softmax(l2)
 
 
     // let r = reshape_node(x_node, vec![28,28]);
-    // let c = conv2d(r, vec![3,3], 32, "he");
+    // let c = conv2d(r, vec![5,5], 32, "he");
+    // // println!("c {:?}",c.tensor.shape);
     // let r1 = relu(c);
+    // // println!("relu {:?}",r1.tensor.shape);
     // let m = max_pool(r1, vec![2,2]);
+    // // println!("mp {:?}",m.tensor.shape);
     // let f = flatten(m);
-    // let l1 = linear(f, 100, "xavier");
-    // let s1 = sigmoid(l1);
-    // let l2 = linear(s1, 10, "xavier");
+    // // println!("f {:?}",f.tensor.shape);
+    // // let f = reshape_node(m, vec![1,144]);
+    // // let l1 = linear(f, 100, "xavier");
+    // // let s1 = sigmoid(l1);
+    // let l2 = linear(f, 10, "xavier");
     // log_softmax(l2)
 }
 
@@ -1545,7 +1610,7 @@ pub(crate) fn simple() -> std::io::Result<()> {
     let dataset_size = 5120; // default: 51200
     let lr = 0.001; // default: 0.001
     let epochs = 10;
-    let bsz = 10; // each element in training set is a batch of inputs.
+    let bsz = 32; // each element in training set is a batch of inputs.
 
 // ========== read in data =============================
     let file = File::open("mnist_train.csv")?;
