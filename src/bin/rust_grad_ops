@@ -6,6 +6,7 @@ use csv;
 use rand_distr;
 use rayon::prelude::*;
 use chrono::prelude::*;
+use indicatif::{ProgressBar, ProgressStyle};
 
 
 // ----------------------------------- Notes:  ----------------------------------------------
@@ -812,11 +813,14 @@ fn _match_bsz(mut root: Box<Node>, input_direction: &str) -> Box<Node> {
     root
 }
 
-fn _change_dropout(mut root: Box<Node>, drop_prob: f64) -> Box<Node> {
+fn _change_dropout(mut root: Box<Node>, mut drop_prob: f64) -> Box<Node> {
     if root.op == "do" {
         let mut drop_node = root.right.unwrap();
         drop_node.tensor.data[0] = drop_prob;
         root.right = Some(drop_node);
+        if drop_prob != 0.0 {
+            drop_prob = 0.25;
+        }
     }
     match root.left {
         Some(x) => {
@@ -1209,10 +1213,10 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
         // println!("bias: {:?}", bias.grad.shape);
         // println!("input: {:?}", input.grad.shape);
 
-        let mut bias_grad: Vec<f64> = Vec::new();
-        ((0..bias.grad.data.len()).into_par_iter().map( |j| { // for each coefficient
+        // let mut bias_grad: Vec<f64> = Vec::new();
+        let bias_grad: Vec<f64> = (0..bias.grad.data.len()).into_iter().map( |j| { // for each coefficient
             root.grad.data[j..].iter().step_by(root.grad.diminc[0]).sum::<f64>() // sum the gradients of that coefficient for every batch
-        }).collect_into_vec(&mut bias_grad)); 
+        }).collect(); //.collect_into_vec(&mut bias_grad)); 
         bias.grad.data = bias_grad;
 
 
@@ -1577,16 +1581,17 @@ fn _simple(shaper: &Vec<usize>) -> Box<Node> {
 
 
     let r1 = reshape_node(x_node, vec![28,28]);
-    let c1 = conv2d(r1, vec![5,5], 64, "he");
+    let c1 = conv2d(r1, vec![3,3], 32, "he");
     let re1 = relu(c1);
-    let m1 = max_pool(re1, vec![2,2]);
-    let c2 = conv2d(m1, vec![3,3], 32, "he");
+    let c2 = conv2d(re1, vec![3,3], 64, "he");
     let re2 = relu(c2);
-    // let m2 = max_pool(re2, vec![2,2]);
-    let r2 = flatten(re2);
-    // let l1 = linear(r2, 100, "xavier");
-    // let s1 = sigmoid(l1);
-    let l2 = linear(r2, 10, "xavier");
+    let m1 = max_pool(re2, vec![2,2]);
+    // let d1 = dropout(m1, 0.25);
+    let r2 = flatten(m1);
+    let l1 = linear(r2, 128, "he");
+    let re3 = relu(l1);
+    // let d2 = dropout(re3, 0.5);
+    let l2 = linear(re3, 10, "xavier");
     log_softmax(l2)
 
 
@@ -1607,10 +1612,10 @@ fn _simple(shaper: &Vec<usize>) -> Box<Node> {
 }
 
 pub(crate) fn simple() -> std::io::Result<()> {
-    let dataset_size = 5120; // default: 51200
+    let dataset_size = 51200; // default: 51200
     let lr = 0.001; // default: 0.001
     let epochs = 10;
-    let bsz = 32; // each element in training set is a batch of inputs.
+    let bsz = 1; // each element in training set is a batch of inputs.
 
 // ========== read in data =============================
     let file = File::open("mnist_train.csv")?;
@@ -1702,22 +1707,24 @@ pub(crate) fn simple() -> std::io::Result<()> {
     println!("Starting at {:?}", Utc::now());
     println!("======= START TRAINING =======");
     for epoch in 0..epochs {
-        let now = Instant::now();
         shuffle_xy(&mut x_train, &mut y_train);
+        let train_bar = ProgressBar::new(x_train.len() as u64);
+        train_bar.set_style(ProgressStyle::with_template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg} ")
+            .unwrap().progress_chars("##-"));
+        let epoch_label = "Epoch".to_owned() + &epoch.to_string();
+        train_bar.set_message(epoch_label);
+        let now = Instant::now();
         for i in 0..x_train.len() {
             let x = &x_train[i]; 
             let y = &y_train[i];
-            // println!("staring forward ====");
             out = forward(out, x);
-            // println!("staring loss ====");
             nll_loss(&mut out, y, false);
-            // println!("staring backward ====");
             out = backward(out);
-            // batch(i, &mut batch_grads, &mut out, &mut opt, batch_size, dataset_size, lr);
-            // println!("staring step ====");
             opt.step(&mut out);
             opt.exp_lr_decay(lr, 0.95, (x_train.len()* epochs) as f64);
-            // println!("staring test ====");
+            train_bar.inc(1);
+            // let cur_time = now.elapsed().as_secs().to_string();
+            // train_bar.set_prefix(cur_time);
 
 
             // if i == x_train.len() - 1  && epoch > 50{  // && epoch == epochs - 1
@@ -1733,25 +1740,30 @@ pub(crate) fn simple() -> std::io::Result<()> {
         let extra_seconds = elapsed_time % 60;
         let mins = elapsed_time / 60;
         let mut total_loss = 0.0;
+        train_bar.finish();
+        out = _change_dropout(out, 0.0);
 
-        // for t in 0..x_train.len() {
-        //     let x = &x_train[t]; 
-        //     let y = &y_train[t]; 
-        //     out = forward(out, &x);
-        //     let loss = nll_loss(&mut out, y);
-        //     total_loss += loss;
-        // }
-        // println!("Epoch {} | {} | {} minutes {} seconds", epoch, total_loss / (x_train.len() as f64), mins, extra_seconds);
-        
-        for t in 0..x_test.len() {
-            let x = &x_test[t]; 
-            let y = &y_test[t]; 
+        for t in 0..x_train.len() {
+            let x = &x_train[t]; 
+            let y = &y_train[t]; 
             out = forward(out, &x);
             let loss = nll_loss(&mut out, y, true);
             total_loss += loss;
         }
-        println!("Epoch {} | {} | {} minutes {} seconds", epoch, total_loss / (x_test.len() as f64), mins, extra_seconds);
+        println!("Epoch {} | {} | {} minutes {} seconds", epoch, total_loss / (x_train.len() as f64), mins, extra_seconds);
         
+        
+        // for t in 0..x_test.len() {
+        //     let x = &x_test[t]; 
+        //     let y = &y_test[t]; 
+        //     out = forward(out, &x);
+        //     let loss = nll_loss(&mut out, y, true);
+        //     total_loss += loss;
+        // }
+        // println!("Epoch {} | {} | {} minutes {} seconds", epoch, total_loss / (x_test.len() as f64), mins, extra_seconds);
+        
+        out = _change_dropout(out, 0.5);
+
         if total_loss < best_epoch_loss {
             best_epoch_loss = total_loss;
             best_epoch = epoch;
@@ -1770,6 +1782,7 @@ pub(crate) fn simple() -> std::io::Result<()> {
     let mut correct = 0;
     let mut incorrect = 0;
     let mut total_loss = 0.0;
+    out = _change_dropout(out, 0.0);
     for t in 0..x_val.len() {
         let x = &x_val[t]; 
         let y = &y_val[t]; 
