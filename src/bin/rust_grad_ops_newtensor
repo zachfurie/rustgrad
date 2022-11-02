@@ -29,93 +29,33 @@ struct Node {
 	require_grad: bool,
 }
 
-struct Tensor {
-	data:  Vec<f64>, // Float64 all tensor data in a single slice 
-	shape: Vec<usize>, // Int  [i] = length of dimension i
-    diminc: Vec<usize>,
+struct Tensor4d<const BSZ: usize, const DIM0: usize, const DIM1: usize, const CHANS: usize> {
+    data: [[[[f64; CHANS]; DIM1]; DIM0]; BSZ], 
 }
-// SmallVec<[usize;4]> for shape and diminc
 
-struct TensorT<const BSZ: usize, const DIM0: usize, const DIM1: usize, const CHANS: usize> {
-    data: [[[[f64; CHANS]; DIM1]; DIM0]; BSZ], // Float64 all tensor data in a single slice 
+struct Tensor3d<const BSZ: usize, const DIM0: usize, const DIM1: usize> {
+    data: [[[f64;  DIM1]; DIM0]; BSZ],
 }
 
 
 //  ----------------------------------- Auxiliary Functions:  -----------------------------------
 
-impl Tensor {
-    fn zeros(shaper: &Vec<usize>) -> Tensor {
-        let mut data_len: usize = 1;
-        let mut incs =  vec![0; shaper.len()];
-        for i in 0..shaper.len() {
-            data_len *= shaper[i];
-            if i == shaper.len()-1 {
-                incs[i] = 1;
-            } else {
-                let mut temp = 1;
-                for ii in i + 1..shaper.len() {
-                    temp *= shaper[ii]
-                }
-                incs[i] = temp 
-            }
-        }
+impl Tensor4d {
+    fn zeros(bsz: usize, dim0: usize, dim1: usize, chans: usize) -> Tensor {
         Tensor {
-            data:   vec![0.; data_len], // all tensor data in a single slice 
-            shape: shaper.to_vec(), // [i] = length of dimension i
-            diminc: incs,
+            data:[[[[0.; chans]; dim1]; dim0]; bsz], 
         }
     }
 
-    fn ones(shaper: &Vec<usize>) -> Tensor {
-        let mut data_len: usize = 1;
-        let mut incs =  vec![0; shaper.len()];
-        for i in 0..shaper.len() {
-            data_len *= shaper[i];
-            if i == shaper.len()-1 {
-                incs[i] = 1;
-            } else {
-                let mut temp = 1;
-                for ii in i + 1..shaper.len() {
-                    temp *= shaper[ii]
-                }
-                incs[i] = temp 
-            }
-        }
+    fn ones(bsz: usize, dim0: usize, dim1: usize, chans: usize) -> Tensor {
         Tensor {
-            data:   vec![1.; data_len], // all tensor data in a single slice 
-            shape: shaper.to_vec(), // [i] = length of dimension i
-            diminc: incs
+            data:[[[[1.; chans]; dim1]; dim0]; bsz], 
         }
     }
 
-    fn xavier(shaper: &Vec<usize>) -> Tensor {
-        let mut data_len: usize = 1;
-        let mut incs =  vec![0; shaper.len()];
-        for i in 0..shaper.len() {
-            data_len *= shaper[i];
-            if i == shaper.len()-1 {
-                incs[i] = 1;
-            } else {
-                let mut temp = 1;
-                for ii in i + 1..shaper.len() {
-                    temp *= shaper[ii]
-                }
-                incs[i] = temp 
-            }
-        }
-        let mut t = Tensor {
-            data:   vec![1.; data_len], // all tensor data in a single slice 
-            shape: shaper.to_vec(), // [i] = length of dimension i
-            diminc: incs,
-        };
-        let std:f64;
-        if shaper.len() == 4 {
-            std = ((t.l2()*t.l()) as f64).sqrt();
-        } else if shaper.len() == 3{
-            std = (t.l() as f64).sqrt();
-        } else {
-            panic!("Weight initialization expects at least 3 dimensional weight (bsz, l2, l) ir 4 dimensional weight (bsz, l2, l, channels)")
-        }
+    fn xavier(bsz: usize, dim0: usize, dim1: usize, chans: usize) -> Tensor {
+        let ones = Tensor4d::ones(bsz, dim0, dim1, chans);
+        let std:f64 = ((dim0*dim1) as f64).sqrt();
         let mut rng = rand::thread_rng();
         for i in 0..data_len {
             let y: f64 = rng.gen(); // generates a float between 0 and 1
