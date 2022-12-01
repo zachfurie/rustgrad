@@ -12,11 +12,7 @@ use smallvec::SmallVec;
 
 // ----------------------------------- Notes:  ----------------------------------------------
 
-// Maybe use mutable arrays instead of vecs? Would take a lot of refactoring, since as of now I don't know how to have a Tensor{} struct with an array field if array size is not known until initialization.
-
-// Not using many parallel iterators since they actually slowed down runtime. Probably because I'm already using up all the threads.
-
-// need a function that changes drop_prob to 0 on all dropout nodes, so there is no dropout during test/val
+// THIS FILE IS NOT AT ALL FINISHED. I WAS PLANNING ON TRYING A DIFFERENT DATA STRUCTURE FOR TENSORS, BUT DECIDED THAT REFACTORING THE WHOLE LIBRARY WOULD NOT BE WORTH THE TIME WHEN I COULD INSTEAD WORK ON A NEW PROJECT
 
 //  ----------------------------------- Data Structures:  -----------------------------------
 

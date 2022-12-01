@@ -1,76 +1,41 @@
 
 # Deep learning in Rust
 
-This project is for me to learn Rust
-
-*TO DO*
-* fix conv2D
-* multithreading
+This project was a way for me to learn Rust and get more familiar with the internals of neural networks.
 
 
 *Example Usage*
 ```rust
 // Define NN
-fn _simple(dim0: usize, dim1: usize) -> Box<Node> {
-    let x_placeholder = Tensor::zeros(&vec![dim0, dim1]);
-	let mut x_node = leaf(x_placeholder, false);
-    x_node.op = "input";
-    let l1 = linear(x_node, 100);
+fn _simple(shape: &Vec<usize>) -> Box<Node> {
+    let x_node = input(shape);
+    let l1 = linear(x_node, 100, "xavier");
     let s1 = sigmoid(l1);
-    let d1 = dropout(s1, 0.1);
-    let l2 = linear(d1, 10);
+    let l2 = linear(s1, 10, "xavier");
     log_softmax(l2)
 }
 
-let mut out = _simple(1, 784);
-
-let batch_size = 32;
-let lr = 0.001; 
-let epochs = 20;
+// Get shape of tensors in batched training set, pass to NN
+let mut out = _simple(&x_train[0].shape); 
 
 // Optimizer
 let mut opt = Adam {
     t: 0.0, 
-    alpha: lr, 
+    alpha: 0.01, 
     prev_m1s: Vec::new(),
     prev_m2s: Vec::new(),
 };
-opt.init_prevs(out.as_ref());
+opt.init_prevs(&out); // Initialize optimizer
 
-// Save best params
-let mut best_epoch = 0;
-let mut best_epoch_loss = 999999.9;
-let mut best_params: Vec<Tensor> = Vec::new();
-init_best(best_params.as_mut(), out.as_ref());
-
-// Batch gradients
-let mut batch_grads: Vec<Tensor> = Vec::new();
-init_batch_grads(&mut batch_grads, &out);
-
+// Training on batched inputs
 for epoch in 0..epochs {
+    let mut total_loss = 0.0;
     for i in 0..x_train.len() {
         let x = &x_train[i]; 
         let y = &y_train[i];
         out = forward(out, x);
-        nll_loss(&mut out, y);
+        total_loss += nll_loss(&mut out, y, false);
         out = backward(out);
-        // batch() handles minibatching, optimizer step, learning rate decay
-        batch(i, &mut batch_grads, &mut out, &mut opt, batch_size, dataset_size, lr);
-    }
-
-    let mut total_loss = 0.0;
-    for t in 0..x_test.len() {
-        let x = &x_test[t]; 
-        let y = &y_test[t]; 
-        out = forward(out, &x);
-        let loss = nll_loss(&mut out, y);
-        total_loss += loss;
-    }
-
-    if total_loss < best_epoch_loss {
-        best_epoch_loss = total_loss;
-        best_epoch = epoch;
-        save_best(best_params.as_mut(), out.as_mut(), 0);
-    }
+        opt.step(&mut out);
 }
 ```

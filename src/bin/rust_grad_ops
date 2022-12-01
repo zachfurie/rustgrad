@@ -7,7 +7,7 @@ use rand::prelude::*;
 // use rayon::prelude::*;
 use chrono::prelude::*;
 use indicatif::{ProgressBar, ProgressStyle};
-use smallvec::SmallVec;
+// use smallvec::SmallVec;
 
 
 // ----------------------------------- Notes:  ----------------------------------------------
@@ -308,6 +308,20 @@ fn leaf(tens: Tensor, require_grad: bool) -> Box<Node> {
         tensor: tens, 
         grad: zero_grad, 
         require_grad
+    })
+}
+
+// Syntactic sugar for leaf nodes that are inputs
+fn input(shaper: &Vec<usize>) -> Box<Node> {
+    let zero_data = Tensor::zeros(shaper);
+	let zero_grad = Tensor::ones(shaper);
+	Box::new(Node {
+        left: None,
+        right: None, 
+        op: "input", 
+        tensor: zero_data, 
+        grad: zero_grad, 
+        require_grad: false
     })
 }
 
@@ -1675,14 +1689,7 @@ fn backward(mut root: Box<Node>) -> Box<Node>{
 // ----------------------------------- TESTING (will be removed when done) -----------------------------------
 
 fn _simple(shaper: &Vec<usize>) -> Box<Node> {
-    let x_placeholder = Tensor::zeros(shaper);
-	let mut x_node = leaf(x_placeholder, false);
-    x_node.op = "input";
-    let _bsz = shaper[0];
-
-    // let l1 = linear(x_node, 10, "he");
-    // log_softmax(l1)
-
+    let x_node = input(shaper);
     let l1 = linear(x_node, 100, "xavier");
     let s1 = sigmoid(l1);
     let l2 = linear(s1, 10, "xavier");
@@ -1750,7 +1757,7 @@ fn _simple(shaper: &Vec<usize>) -> Box<Node> {
 }
 
 pub(crate) fn simple() -> std::io::Result<()> {
-    let dataset_size = 60000; //51200; // default: 51200
+    let dataset_size = 60000; // default: 60,000
     let lr = 0.001; // default: 0.001
     let epochs = 10;
     let bsz = 60; // each element in training set is a batch of inputs.
@@ -1840,10 +1847,10 @@ pub(crate) fn simple() -> std::io::Result<()> {
     let mut best_epoch_loss = 999999.9;
     let mut best_params: Vec<Tensor> = Vec::new();
     init_best(best_params.as_mut(), out.as_ref());
-    // let mut batch_grads: Vec<Tensor> = Vec::new();
-    // init_batch_grads(&mut batch_grads, &out);
+
     println!("Starting at {:?}", Utc::now());
     println!("======= START TRAINING =======");
+    
     for epoch in 0..epochs {
         shuffle_xy(&mut x_train, &mut y_train);
         let train_bar = ProgressBar::new(x_train.len() as u64);
